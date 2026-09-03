@@ -1,4 +1,4 @@
-# Muse Minimax Director V1.2
+# Muse Minimax Director V1.4
 
 **Timeline-based director node for MiniMax H3 in ComfyUI, with Seed Hunt scouting, two-stage sampling, and hard-frozen chunk-boundary continuity**
 
@@ -6,7 +6,7 @@ Built by [Muse Collective](https://musecollective.co.uk) — write a single flow
 
 This is a fork of [Muse Minimax Director](https://github.com/muse-collective-26/MiniMaxH3-Director) that adds independent per-candidate **Seed Hunt** toggles — scout up to 4 candidate seeds in one run at low resolution, then pick the best one and continue it at full resolution with the bundled [Muse Minimax Refine](#muse-minimax-refine-bundled) node — plus two-stage sampling and a VAE re-encode continuity mode that eliminates the visible jump at chunk boundaries on multi-chunk renders (see [Changelog](#changelog) and [Chunk continuity, in detail](#chunk-continuity-in-detail)). The original repo stays as the simpler, single-generation version; this one is for anyone who wants the scouting workflow, longer multi-chunk renders, or both.
 
-This repository bundles **two** ComfyUI nodes — Muse Minimax Director V1.2 and its companion Muse Minimax Refine V1.2 — installed together as one package. See [Muse Minimax Refine (bundled)](#muse-minimax-refine-bundled) below for what it does and how to wire it up.
+This repository bundles **two** ComfyUI nodes — Muse Minimax Director V1.4 and its companion Muse Minimax Refine V1.4 (Beta-matched) — installed together as one package. See [Muse Minimax Refine (bundled)](#muse-minimax-refine-bundled) below for what it does and how to wire it up.
 
 ![ComfyUI Custom Node](https://img.shields.io/badge/ComfyUI-Custom%20Node-orange?style=flat-square)
 ![MiniMax H3](https://img.shields.io/badge/MiniMax-H3-blue?style=flat-square)
@@ -15,6 +15,19 @@ This repository bundles **two** ComfyUI nodes — Muse Minimax Director V1.2 and
 ---
 
 ## Changelog
+
+### v3.0.0
+- **Fixed: reference videos were silently capped at 200 frames total, regardless of how long a trim window was actually requested.** A 30fps clip trimmed to 10 seconds needs 300 frames to cover that window; the old flat cap stopped decoding at 200 (~6.67s), so the back third of every reference video's motion was never loaded into the tensor H3 actually received — no error, no warning, just an incomplete reference. This was the real root cause of a reference video's motion appearing to be "followed for a few seconds, then abandoned," regardless of any prompt wording changed around it.
+- **Fixed: reference video frames were also handed to H3 at the source's native frame rate, not resampled to H3's actual expected 24fps.** The stock H3 node treats every frame it receives as spaced 1/24th of a second apart; a 30fps (or any non-24fps) source was therefore played back at the wrong effective speed even within whatever portion did make it through the old cap. Reference videos are now resampled onto a genuine 24fps grid using each frame's real timestamp, correct regardless of the source's declared frame rate.
+- **New: "Continue across chunks"** — an opt-in per-video-slot toggle (Reference mode only) that lets one long reference video (e.g. a 45-second performance) drive motion across an entire multi-chunk render. Set In/Out becomes the full performance's window; each chunk automatically carves its own correctly-timed slice out of it, using the same chunk boundaries the rest of the compiled prompt already uses. Includes a companion **"Insert Chunks to Cover This"** control that adds however many chunks are needed to cover a video's Set In/Out window automatically (and can trigger straight from editing Set Out, not just its own button), rather than requiring the total duration to be worked out and set by hand.
+- **New: "Embed this clip's real audio over the final output"** — an opt-in per-video-slot toggle that literally overlays the source video's own real audio onto the finished output after generation, bypassing whatever H3 itself would have generated for that channel. Distinct from Audio State's `fully_copy`, which still asks H3 to *generate* matching audio (only ever as faithful as the model's own compliance) — this is a literal, guaranteed copy instead, trimmed to match however long the actual rendered output turns out to be. Not intended for Lip Sync (no word-level timing).
+- **New: "Analyze First Frame"** — a per-video-slot button (Reference mode) that captures the frame at that video's current Set In point and generates a scene-anchor description — environment, key objects and their relative positions, colors, lighting — distinct from the existing per-character Analyze route, which only describes one main subject and would skip the surrounding scene entirely. Feeds automatically into the compiled prompt (prepended ahead of every CUT) once set, matching MiniMax's own documented guidance to establish scene anchors before describing new content — genuinely useful specifically when adding a new character into an existing scene, where getting a spatial detail wrong (e.g. which side an existing empty seat is actually on) produces a wrong result even with everything else correct.
+- **Corrected several `retention_analysis` wordings that were being applied unconditionally regardless of the actual retention level selected**, in some cases directly contradicting it:
+  - A reference video's retention line used to say "no visible scene, environment, or on-screen content from this video is reused" for every retention option, including `partially_preserved` ("duplicate video, replace character") — whose own official definition is the opposite of that sentence. Now branches per the actual selected level.
+  - A standalone reference audio clip's retention line used to say "guides dialogue delivery without copying the original signal" for `partially_copy` too, whose own official definition is "part of the timeline... **is** copied" — a direct, confirmed-real contradiction that was affecting voice-clone accent accuracy on generated dialogue lines. Now branches per the official audio-marker definitions instead of one sentence for all three non-`fully_copy` levels.
+- **Fixed a display bug** where a video's Retention dropdown could show the wrong label after a reload (a generic "partially preserved" instead of the clearer "duplicate video, replace character (recommended for editing)") despite the underlying value being identical either way — removed the duplicate option entirely rather than patch the selection logic.
+- **Retired the old plain Refine, Refine V1.3, Refine V2, and Muse Model Route bundle.** Each was a companion to an earlier Director variant this release replaces outright — plain Refine paired with the original V1.2, V1.3 added its own First/Last Frame + Hybrid work, V2 was built for the separate TwoStage-Beta package's own scouting/continuity mechanism. Muse Minimax Refine V1.4 is this release's own matched companion. None of the retired nodes are gone — they're simply not part of this package going forward; anyone who needs one of them specifically can still get it from where it already lived.
+- **Dependency note:** no new custom node package is required for any of the above. The only change is that `<Audio N>` bound to a reference video's own audio can now also read `partially_copy`/`weak_reference` correctly, and one new internal call (`MiniMaxH3SongMaskedAVContext`) is used — both already live inside **[ComfyUI-H3-Motion-Context-MultiRef](https://github.com/seitanism/ComfyUI-H3-Motion-Context-MultiRef)**, the same package already required for VAE Re-encode Carry. If you installed that a while ago, make sure your copy is up to date rather than installing anything new.
 
 ### v2.5.2
 - **New diagnostic-only toggle: `vae_reencode_carry_video_only_test`.** Investigating a real, timed symptom (audio muddiness starting right around a chunk boundary and never recovering for the rest of the video). Isolates whether the carry mechanism's audio half is the cause by reproducing only the proven video-prefix/video-mask math directly (not calling `MiniMaxH3GeneratedAVMaskedContext`, which requires both streams present and always overwrites both) and leaving chunk 2's own audio latent + noise mask genuinely untouched — same `carry_n`/alignment/post-generation trim as the existing mechanism throughout. Only active when `vae_reencode_carry_test` is also on; existing behavior is completely unaffected when this stays off. Not a fix — a comparison tool to confirm where the real fix needs to go.
@@ -40,7 +53,7 @@ This repository bundles **two** ComfyUI nodes — Muse Minimax Director V1.2 and
 - **Muse Minimax Refine: hid the "control after generate" seed control.** It always needs to stay on `fixed` — Refine reuses the candidate's exact original seed to continue its noise schedule (see the seed widget's own tooltip), never a fresh roll — but ComfyUI's frontend auto-attaches this control to any widget named "seed" regardless of that. Left visible, it's a real trap: a viewer reported Refine silently restarting from scratch after this defaulted to "randomize" on load, and worked around it by hand. Now locked to `fixed` and hidden, on load and on node creation, so that failure mode isn't possible anymore.
 
 ### v2.3.2
-- **Fixed: Refine wouldn't run at all — for any candidate — unless all 4 Seed Hunt candidates had been scouted.** Root cause: `MuseMinimaxDirectorV1_2`'s `candidate_N_latent` outputs used `ExecutionBlocker` to mark a candidate that never ran, but ComfyUI's own executor skips a node's function entirely if *any* of its inputs is an `ExecutionBlocker` — not just the input actually being used. Since Muse Minimax Refine V1.2 has all four `candidate_N_latent` sockets wired at once regardless of which one is picked, scouting fewer than 4 candidates meant 1-3 of those sockets always carried a blocker, silently preventing Refine from ever running — even when picking a candidate that *did* generate successfully. Unfilled candidate latents now use a plain marker dict instead, which Refine checks for itself and blocks on cleanly only when that specific slot is the one actually picked.
+- **Fixed: Refine wouldn't run at all — for any candidate — unless all 4 Seed Hunt candidates had been scouted.** Root cause: `MuseMinimaxDirectorV14`'s `candidate_N_latent` outputs used `ExecutionBlocker` to mark a candidate that never ran, but ComfyUI's own executor skips a node's function entirely if *any* of its inputs is an `ExecutionBlocker` — not just the input actually being used. Since Muse Minimax Refine V1.4 (Beta-matched) has all four `candidate_N_latent` sockets wired at once regardless of which one is picked, scouting fewer than 4 candidates meant 1-3 of those sockets always carried a blocker, silently preventing Refine from ever running — even when picking a candidate that *did* generate successfully. Unfilled candidate latents now use a plain marker dict instead, which Refine checks for itself and blocks on cleanly only when that specific slot is the one actually picked.
 
 ### v2.3.1
 - **Seed Hunt: replaced the three independent Candidate 2/3/4 toggles with a single "Candidates to scout" count (1-4).** The old toggles let you tick e.g. only Candidate 4 and skip 2/3 — meaningless, since candidates are just different random seeds, and it read backwards ("Candidate 4" looked like "run 4" but actually meant "just slot 4, alone, skipping the rest"). The count always runs candidates 1..N in sequence, matching how everyone actually reads that control.
@@ -53,7 +66,7 @@ This repository bundles **two** ComfyUI nodes — Muse Minimax Director V1.2 and
 - **Muse Model Route** is now bundled here too — a tiny utility node used by the example workflow to route the Reference or First/Last-Frame model into the Director's single `model` input depending on mode. It previously wasn't published anywhere, so anyone downloading the example workflow couldn't actually get it — that's fixed now.
 
 ### v2.2.0
-- **Muse Minimax Refine V1.2 is now bundled in this same repository** instead of living separately — one install gets you both nodes. See [Muse Minimax Refine (bundled)](#muse-minimax-refine-bundled) for what it does.
+- **Muse Minimax Refine V1.4 (Beta-matched) is now bundled in this same repository** instead of living separately — one install gets you both nodes. See [Muse Minimax Refine (bundled)](#muse-minimax-refine-bundled) for what it does.
 - Refine's own module docstring was out of date (still described an older img2img-style pixel re-sample) — corrected to describe what the node actually does: a genuine latent-continuation Stage 2, picking up the candidate's own sigma schedule exactly where Stage 1 left off.
 
 ### v2.1.0
@@ -68,7 +81,7 @@ This repository bundles **two** ComfyUI nodes — Muse Minimax Director V1.2 and
 - Reference Settings folded into the Resolution box (was its own box with only two rows in it).
 - Shrinking Total Duration or Chunk Size now actually removes the trailing chunk(s) instead of leaving them stuck and invisible (confirms first if a chunk about to be dropped still has real CUT text).
 - The node's own panel now grows/shrinks with its content reliably — fixed a real bug where it could grow unbounded on some workflows.
-- **Updated example workflow** (`workflows/muse_minimax_h3_director_V1.2.json`, replacing the old Seed Hunt scouting one) — demonstrates Two-Stage Sampling and VAE Re-encode Carry instead.
+- **Updated example workflow** (`workflows/muse_minimax_h3_director_V1.4.json`, replacing the old Seed Hunt scouting one) — demonstrates Two-Stage Sampling and VAE Re-encode Carry instead.
 
 ### v1.1.0
 - **Fixed a crash on old saved workflows.** If you'd saved a workflow before this update and it failed to load with an error mentioning `Cannot create property 'characters'`, that's fixed — the node now resets its timeline gracefully instead of blocking the whole workflow from loading. If you hit this, the safest fix is to delete the Muse Minimax Director node from your old workflow and add a fresh one in its place, then re-enter your references/CUTs.
@@ -124,9 +137,10 @@ MiniMax H3 is a strong omni-modal model, but its native inputs are low-level: nu
 
 | Node | Display name | Description |
 |------|---------------|-------------|
-| `MuseMinimaxDirectorV1_2` | Muse Minimax Director V1.2 (Two-Stage) | Timeline-based director for MiniMax H3 — chunking, prompt compilation, Seed Hunt scouting, continuity |
-| `MuseMinimaxRefineV1_2` | Muse Minimax Refine V1.2 (Latent, Two-Stage) | Companion second-pass node — continues a picked Seed Hunt candidate's own sigma schedule at a higher resolution (see [Muse Minimax Refine (bundled)](#muse-minimax-refine-bundled)) |
-| `MuseModelRoute` | Muse Model Route | Tiny utility — routes one MODEL input to exactly one of two outputs based on a boolean switch, the other forced to `None`. Used in the example workflow to send either the Reference or First/Last-Frame model into the Director's `model` input depending on mode. |
+| `MuseMinimaxDirectorV14` | Muse Minimax Director V1.4 (Two-Stage) | Timeline-based director for MiniMax H3 — chunking, prompt compilation, Seed Hunt scouting, continuity |
+| `MuseMinimaxRefineV14` | Muse Minimax Refine V1.4 (Beta-matched) | Companion second-pass node — continues a picked Seed Hunt candidate's own sigma schedule at a higher resolution (see [Muse Minimax Refine (bundled)](#muse-minimax-refine-bundled)) |
+
+Plain Refine, Refine V1.3, Refine V2, and Muse Model Route (a tiny MODEL-routing utility used by an older example workflow) were retired from this package in v3.0.0 — see the [Changelog](#changelog). None are gone from existence, just no longer bundled here.
 
 ---
 
@@ -134,7 +148,7 @@ MiniMax H3 is a strong omni-modal model, but its native inputs are low-level: nu
 
 - A recent ComfyUI install with the stock `MiniMaxH3ReferenceToVideo` / `MiniMaxH3ImageToVideo` / `MiniMaxH3SigmaShift` nodes available (these ship with ComfyUI core — no separate node pack needed for the model support itself, only for this timeline layer). If this node fails to load with `ModuleNotFoundError: No module named 'comfy_extras.nodes_minimax_h3'` in the console, your ComfyUI core build predates native MiniMax H3 support — update ComfyUI core itself (not this node) and restart.
 - MiniMax H3 model weights, downloaded separately by you — see [Model setup](#model-setup)
-- **[ComfyUI-H3-Motion-Context-MultiRef](https://github.com/seitanism/ComfyUI-H3-Motion-Context-MultiRef)** — required if you turn on **Enable VAE Re-encode Carry** (Director chunk continuity), and also used by the bundled Refine node when it re-stitches a multi-chunk Latent-Only Scouting candidate. Install via ComfyUI Manager or:
+- **[ComfyUI-H3-Motion-Context-MultiRef](https://github.com/seitanism/ComfyUI-H3-Motion-Context-MultiRef)** — required if you turn on **Enable VAE Re-encode Carry** (Director chunk continuity), used by the bundled Refine node when it re-stitches a multi-chunk Latent-Only Scouting candidate, and (as of v3.0.0) also used for Lip Sync's master-song masked context. If you already installed this a while ago for VAE Re-encode Carry, make sure it's up to date — the Lip Sync usage relies on a node class this package added after some earlier installs would have pulled it. Install via ComfyUI Manager or:
   ```bash
   cd ComfyUI/custom_nodes
   git clone https://github.com/seitanism/ComfyUI-H3-Motion-Context-MultiRef
@@ -198,7 +212,9 @@ You will also need a matching CLIP text encoder, a video VAE, and an audio VAE �
 
 ## Example workflow
 
-A ready-to-load workflow is included at [`workflows/muse_minimax_h3_director_V1.2.json`](workflows/muse_minimax_h3_director_V1.2.json) — demonstrates the two headline features from this version: **Two-Stage Sampling** and **VAE Re-encode Carry** continuity are both switched on, `seed_hunt` is off. Model loaders for both the Reference-to-Video and First/Last-Frame checkpoints are wired up behind a switch (`MuseModelRoute`/`LazySwitchKJ`) so you can flip between them, and a [Muse Minimax Refine](#muse-minimax-refine-bundled) node is wired up for a second-pass upscale. Reference slots are left empty on purpose so you drop in your own characters and location rather than inheriting someone else's.
+A ready-to-load workflow is included at [`workflows/muse_minimax_h3_director_V1.4.json`](workflows/muse_minimax_h3_director_V1.4.json) — demonstrates **Two-Stage Sampling** and **VAE Re-encode Carry** continuity, both switched on, `seed_hunt` off, with a [Muse Minimax Refine](#muse-minimax-refine-bundled) node wired up for a second-pass upscale. Reference slots are left empty on purpose so you drop in your own characters and location rather than inheriting someone else's.
+
+**Known gap, not yet fixed:** this file still wires the Reference-to-Video and First/Last-Frame checkpoints through `MuseModelRoute`, which v3.0.0 retired — that specific piece of the saved graph will show as a missing node until it's rewired by hand (a plain switch node, or just picking one checkpoint path and deleting the other) or the workflow file gets a proper update. It also doesn't demonstrate any of v3.0.0's new features (Continue across chunks, Embed real audio, Analyze First Frame) — those aren't shown in any saved example yet.
 
 It also uses a few extra nodes purely for convenience/performance, on top of what's required above — search ComfyUI Manager for these if they show as missing when you load it:
 
@@ -424,7 +440,7 @@ An earlier version used three independent per-candidate toggles instead of a cou
 
 ## Muse Minimax Refine (bundled)
 
-`MuseMinimaxRefineV1_2` is the companion second-pass node bundled in this same repository (see [Nodes included](#nodes-included)) — a standalone continuation node, not a modification of the Director. It picks up a chosen Seed Hunt candidate's own sigma schedule exactly where Stage 1 left off and finishes it at a higher resolution — a genuine latent continuation, not a from-pixels img2img re-sample, so nothing about the candidate's own content changes, only its resolution.
+`MuseMinimaxRefineV14` is the companion second-pass node bundled in this same repository (see [Nodes included](#nodes-included)) — a standalone continuation node, not a modification of the Director. It picks up a chosen Seed Hunt candidate's own sigma schedule exactly where Stage 1 left off and finishes it at a higher resolution — a genuine latent continuation, not a from-pixels img2img re-sample, so nothing about the candidate's own content changes, only its resolution.
 
 **Inputs**, beyond `model`/`clip`/`vae`/`audio_vae`:
 - `prompt` — wire the Director's `compiled_prompt` output. Reused as-is for a single-chunk candidate; ignored for a multi-chunk one (each chunk already carries its own saved prompt — see below).
