@@ -66,8 +66,10 @@ import gc
 import os
 import re
 import tempfile
+import uuid
 
 import av
+import comfy.samplers
 import comfy.utils
 import folder_paths
 import numpy as np
@@ -78,13 +80,150 @@ from server import PromptServer
 
 from comfy_extras.nodes_minimax_h3 import (
     MiniMaxH3ReferenceToVideo, MiniMaxH3ImageToVideo, MiniMaxH3SigmaShift, align_frame_count,
-    CANVAS_MULTIPLE,
+    CANVAS_MULTIPLE, _resize, REF_IMAGE_SHORT_EDGE,
 )
+from .muse_minimax_hybrid_conditioning import MiniMaxH3HybridRefAndKeyframe
 from comfy_extras.nodes_resolution import AspectRatio, ASPECT_RATIOS
 from comfy_execution.graph import ExecutionBlocker
+import node_helpers
 
 log = logging.getLogger(__name__)
 
+
+# ── Lip Sync long-form project storage ─────────────────────────────────────
+# Projects live outside temp/output so a reboot does not invalidate a resume.
+def _long_form_root():
+    root = os.path.join(folder_paths.get_user_directory(), "MuseMinimaxDirector", "long_form_projects")
+    os.makedirs(root, exist_ok=True)
+    return root
+
+
+def _safe_project_id(value):
+    return re.sub(r"[^a-zA-Z0-9_-]+", "-", str(value or "").strip()).strip("-")[:80]
+
+
+def _project_dir(project_id):
+    clean = _safe_project_id(project_id)
+    if not clean:
+        raise ValueError("A long-form project must be named and saved before rendering.")
+    return os.path.join(_long_form_root(), clean)
+
+
+def _atomic_json(path, value):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(value, handle, indent=2)
+    os.replace(tmp, path)
+
+
+def _read_project(project_id):
+    path = os.path.join(_project_dir(project_id), "project.json")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Long-form project '{project_id}' has not been saved.")
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+@PromptServer.instance.routes.get("/muse_minimax_director_v1_4/long_form_projects")
+async def _list_long_form_projects(request):
+    projects = []
+    for name in sorted(os.listdir(_long_form_root())):
+        try:
+            data = _read_project(name)
+            projects.append({
+                "project_id": name,
+                "name": data.get("name") or name,
+                "completed_chunk": int(data.get("completed_chunk") or 0),
+                "updated_at": data.get("updated_at"),
+            })
+        except Exception:
+            continue
+    return web.json_response({"projects": projects})
+
+
+@PromptServer.instance.routes.post("/muse_minimax_director_v1_4/save_long_form_project")
+async def _save_long_form_project_route(request):
+    try:
+        body = await request.json()
+        display_name = str(body.get("name") or "Untitled Lip Sync Project").strip()
+        project_id = _safe_project_id(body.get("project_id")) or f"project-{uuid.uuid4().hex[:10]}"
+        directory = _project_dir(project_id)
+        os.makedirs(os.path.join(directory, "completed_chunks"), exist_ok=True)
+        try:
+            old = _read_project(project_id)
+        except Exception:
+            old = {}
+        record = {
+            "version": 1,
+            "project_id": project_id,
+            "name": display_name,
+            "timeline": body.get("timeline") or {},
+            "widgets": body.get("widgets") or {},
+            "completed_chunk": int(old.get("completed_chunk") or 0),
+            "resume_metadata": old.get("resume_metadata") or {},
+            "updated_at": __import__("datetime").datetime.now().isoformat(timespec="seconds"),
+        }
+        _atomic_json(os.path.join(directory, "project.json"), record)
+        return web.json_response({"ok": True, "project": record})
+    except Exception as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=400)
+
+
+@PromptServer.instance.routes.post("/muse_minimax_director_v1_4/load_long_form_project")
+async def _load_long_form_project_route(request):
+    try:
+        body = await request.json()
+        return web.json_response({"ok": True, "project": _read_project(body.get("project_id"))})
+    except Exception as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=404)
+
+
+def _latent_parts_for_save(latent):
+    samples = latent["samples"]
+    parts = list(samples.unbind()) if hasattr(samples, "unbind") else list(samples)
+    return [part.detach().to(device="cpu", dtype=torch.float16).contiguous() for part in parts[:2]]
+
+
+def _latent_from_saved_parts(parts):
+    import comfy.nested_tensor
+    return {"samples": comfy.nested_tensor.NestedTensor(tuple(part.float() for part in parts))}
+
+
+def _load_long_form_checkpoint(project_id):
+    path = os.path.join(_project_dir(project_id), "resume_checkpoint.pt")
+    if not os.path.isfile(path):
+        raise FileNotFoundError("No continuation checkpoint exists for this project yet.")
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def _save_long_form_progress(project_id, completed_chunk, latent, tail_frames, grid_overrun,
+                             chunk_frames, chunk_audio, metadata):
+    directory = _project_dir(project_id)
+    os.makedirs(os.path.join(directory, "completed_chunks"), exist_ok=True)
+    chunk_path = os.path.join(directory, "completed_chunks", f"chunk_{completed_chunk:04d}.pt")
+    chunk_tmp = chunk_path + ".tmp"
+    torch.save({
+        "chunk": int(completed_chunk),
+        "frames": chunk_frames.detach().to(device="cpu", dtype=torch.float16).contiguous(),
+        "audio": chunk_audio["waveform"].detach().to(device="cpu", dtype=torch.float32).contiguous(),
+        "sample_rate": int(chunk_audio["sample_rate"]),
+    }, chunk_tmp)
+    os.replace(chunk_tmp, chunk_path)
+    checkpoint_path = os.path.join(directory, "resume_checkpoint.pt")
+    checkpoint_tmp = checkpoint_path + ".tmp"
+    torch.save({
+        "completed_chunk": int(completed_chunk),
+        "latent_parts": _latent_parts_for_save(latent),
+        "tail_frames": tail_frames.detach().to(device="cpu", dtype=torch.float16).contiguous(),
+        "grid_overrun": int(grid_overrun),
+        "metadata": metadata,
+    }, checkpoint_tmp)
+    os.replace(checkpoint_tmp, checkpoint_path)
+    project = _read_project(project_id)
+    project["completed_chunk"] = int(completed_chunk)
+    project["resume_metadata"] = metadata
+    project["updated_at"] = __import__("datetime").datetime.now().isoformat(timespec="seconds")
+    _atomic_json(os.path.join(directory, "project.json"), project)
 
 # ── Character-analysis backend route ────────────────────────────────────────
 # Self-contained (no dependency on any other Muse package) so Analyze works for
@@ -226,7 +365,60 @@ async def _muse_minimax_call_vlm(provider, base_url, model_name, system_prompt, 
     return True, generated_text
 
 
-@PromptServer.instance.routes.post("/muse_minimax_director_v1_2/analyze_character")
+# 2026-09-04: separate from _MUSE_MINIMAX_ANALYZE_PROMPT on purpose — that one
+# is tuned to output a single identity+detail sentence about ONE main subject
+# (a person, or a place if no person dominates), which is the wrong shape here:
+# for a frame that already has a person AND an environment both meaningfully in
+# it, that prompt would just describe the person and skip the layout entirely.
+# This is for establishing scene anchors — real-world confirmed guidance (both
+# MiniMax's own prompting docs and general video-composition research) that
+# grounding an existing scene's layout in text before describing new content
+# helps place that new content correctly, distinct from (and not contradicted
+# by) tonight's separate finding that describing motion H3 can already see
+# doesn't add much — this is a placement/reasoning task, not a reproduction one.
+_MUSE_MINIMAX_SCENE_ANCHOR_PROMPT = (
+    "Look at this image, a single frame from a video. Write a short paragraph (2-4 sentences) "
+    "establishing the scene as it already exists, for someone about to describe a new person or "
+    "action being added into it. Describe: the environment/setting itself, the key objects, "
+    "furniture, or fixtures visible and roughly where they are positioned relative to each other "
+    "(e.g. 'to the left of', 'behind', 'immediately next to'), the dominant colors and materials, "
+    "and the lighting. If a person is already visible in the frame, mention them and their exact "
+    "position too, since new content will need to be placed correctly relative to them. Do not "
+    "describe any action, motion, or story — only the static scene as it exists in this one frame. "
+    "Do not start with 'This image shows' or similar. Output only the paragraph, nothing else."
+)
+
+
+@PromptServer.instance.routes.post("/muse_minimax_director_v1_4/analyze_scene_anchor")
+async def muse_minimax_analyze_scene_anchor_endpoint(request):
+    try:
+        data = await request.json()
+        image_b64 = data.get("image_b64", "")
+        provider, base_url, model_name = _muse_minimax_resolve_provider(data)
+
+        if provider == "off":
+            return web.json_response({"status": "error", "message": "Analyze is set to Off / Manual."})
+        if not image_b64:
+            return web.json_response({"status": "error", "message": "No frame provided for analysis."})
+
+        b64_list = image_b64 if isinstance(image_b64, list) else [image_b64]
+
+        log.info("[MuseMinimaxDirector] Analyzing scene anchor frame via %s (%s, model '%s')...",
+                 provider, base_url, model_name)
+
+        ok, result = await _muse_minimax_call_vlm(provider, base_url, model_name, _MUSE_MINIMAX_SCENE_ANCHOR_PROMPT, b64_list)
+        if not ok:
+            return web.json_response({"status": "error", "message": result})
+
+        log.info("[MuseMinimaxDirector] Scene anchor analysis complete: %s", result)
+        return web.json_response({"status": "success", "description": result})
+
+    except Exception as e:
+        log.error("[MuseMinimaxDirector] Failed to analyze scene anchor: %s", e)
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+
+@PromptServer.instance.routes.post("/muse_minimax_director_v1_4/analyze_character")
 async def muse_minimax_analyze_character_endpoint(request):
     try:
         data = await request.json()
@@ -255,8 +447,9 @@ async def muse_minimax_analyze_character_endpoint(request):
         log.error("[MuseMinimaxDirector] Failed to analyze reference: %s", e)
         return web.json_response({"status": "error", "message": str(e)}, status=500)
 
-MODE_REFERENCE = "Reference (Omni) — up to 9 images, 3 videos, 3 audio"
+MODE_REFERENCE = "Reference (Omni) — up to 7 images, 3 videos, 3 audio"
 MODE_FIRST_LAST = "First/Last Frame — zero, one, or two frame images"
+MODE_HYBRID = "Hybrid — First/Last Frame + References"
 
 # Chunk-to-chunk continuity only — see the assignment site for why. The stock
 # MiniMaxH3ReferenceToVideo node silently truncates an oversized ref_video down
@@ -283,7 +476,17 @@ _CHUNK_CONTINUITY_REF_FRAMES = 48
 # frame ~22 match again, while every frame in between visibly doesn't.
 _KEYFRAME_INJECTION_FRAMES = 22
 
-MAX_CHARACTER_SLOTS = 9
+# The underlying ref_image pool only has 9 slots total (ref_image_0..8, confirmed
+# from MiniMaxH3ReferenceToVideo's own AutogrowMulti definition). On a continuation
+# chunk (chunk 2+) that pool now has to fit THREE things at once, not two: the
+# character references, the last-frame continuity anchor, and this chunk's own
+# Location image — anchor and Location deliberately coexist rather than one
+# replacing the other (see chunk_ref_images below), so both always need a slot.
+# Chunk 1 never needs the anchor (no predecessor yet), so its own ceiling is
+# characters + Location = 8 — looser than every later chunk's characters + anchor +
+# Location = 9. The binding constraint is the tighter one: 7 characters, always,
+# so continuation chunks never silently overflow the pool and drop something.
+MAX_CHARACTER_SLOTS = 8
 ASPECT_RATIO_OPTIONS = [a.value for a in AspectRatio]
 # Spacing between Seed Hunt's 4 candidate passes' base seeds — large enough to never
 # collide with the small per-chunk `+chunk_idx` offset already applied inside a pass.
@@ -323,6 +526,28 @@ def _unpack_node_result(out):
     return (out,)
 
 
+def _copy_av_latent_to_cpu(latent: dict):
+    """Keep only a detached CPU copy of an H3 AV latent for next-chunk context.
+
+    Lip Sync's two-stage continuation needs the previous final high-resolution
+    latent, but retaining it on the GPU would defeat the Director's aggressive
+    per-chunk VRAM cleanup. Extra latent metadata and masks are intentionally not
+    carried; the song-context node needs only the two sample streams.
+    """
+    samples = latent["samples"]
+    if hasattr(samples, "unbind"):
+        parts = list(samples.unbind())
+    elif isinstance(samples, (tuple, list)):
+        parts = list(samples)
+    else:
+        raise ValueError(f"Expected a joint H3 AV latent, got {type(samples)!r}")
+    if len(parts) < 2:
+        raise ValueError("Expected joint H3 video and audio latent streams")
+    import comfy.nested_tensor
+    cpu_parts = tuple(part.detach().to(device="cpu").clone() for part in parts[:2])
+    return {"samples": comfy.nested_tensor.NestedTensor(cpu_parts)}
+
+
 def _resolve_resolution(aspect_ratio: str, megapixels: float, multiple: int):
     """Exact port of the stock ResolutionSelector node's own formula."""
     w_ratio, h_ratio = ASPECT_RATIOS[AspectRatio(aspect_ratio)]
@@ -350,6 +575,8 @@ def _fit_image_to_target(tensor: torch.Tensor, target_w: int, target_h: int, met
     ref_image_size resolution logic."""
     if tensor is None:
         return None
+    if str(method or "").strip().lower() == "original":
+        return tensor
     n, h, w, c = tensor.shape
     if h == target_h and w == target_w:
         return tensor
@@ -371,6 +598,17 @@ def _fit_image_to_target(tensor: torch.Tensor, target_w: int, target_h: int, met
     left = max(0, (target_w - new_w) // 2)
     canvas[:, top:top + new_h, left:left + new_w, :] = resized
     return canvas
+
+
+def _fit_reference_image(tensor: torch.Tensor, target_w: int, target_h: int, fit: str) -> torch.Tensor:
+    """Apply a reference card's own fit policy. Original deliberately leaves the
+    source untouched so H3 receives the complete reference at its native aspect."""
+    fit = str(fit or "original").strip().lower()
+    if fit == "original":
+        return tensor
+    if fit not in ("crop", "pad", "stretch"):
+        return tensor
+    return _fit_image_to_target(tensor, target_w, target_h, fit)
 
 
 def _load_image_source(b64_or_url: str, filename: str = "") -> torch.Tensor:
@@ -421,9 +659,38 @@ def _parse_timeline(timeline_data: str) -> dict:
         data = {}
     data.setdefault("characters", [])
     data.setdefault("chunks", [])
-    data.setdefault("background", None)
     data.setdefault("refVideos", [])
     data.setdefault("refAudios", [])
+    # Location redesign: a single global `background` (JS still writes this key
+    # on very old saves) plus Hybrid-mode-only `hybridFirstFrame`/`hybridLastFrame`
+    # became a real per-chunk `locations` list and independent
+    # firstFrameImage/lastFrameImage shared by both First/Last Frame and Hybrid
+    # modes. Migrate once here so an old saved timeline_data still renders
+    # correctly: the old background image becomes location slot 0 pinned to
+    # chunk 1 — carrying forward to every later chunk exactly like it always
+    # implicitly did before this redesign.
+    data.setdefault("locations", [])
+    legacy_bg = data.get("background")
+    if not data["locations"] and legacy_bg and (legacy_bg.get("file") or legacy_bg.get("image_b64")):
+        data["locations"] = [{**legacy_bg, "chunk": 1}]
+    # Migrate only when the modern key does not exist at all. An explicit empty
+    # object means the user deliberately cleared that frame in the current UI;
+    # treating it as falsy used to resurrect stale hybridFirst/LastFrame data.
+    if "firstFrameImage" not in data:
+        legacy_first = data.get("hybridFirstFrame")
+        data["firstFrameImage"] = (
+            legacy_first
+            if legacy_first and (legacy_first.get("file") or legacy_first.get("image_b64"))
+            else None
+        )
+    if "lastFrameImage" not in data:
+        legacy_last = data.get("hybridLastFrame")
+        data["lastFrameImage"] = (
+            legacy_last
+            if legacy_last and (legacy_last.get("file") or legacy_last.get("image_b64"))
+            else None
+        )
+    data.setdefault("guideImages", [])
     return data
 
 
@@ -445,23 +712,65 @@ def _resolve_path(rel: str) -> str:
 
 def _load_ref_video_tensor(entry: dict, max_frames: int = 200):
     """Decodes the [trimStartSec, trimEndSec) window of an uploaded reference video
-    clip into an IMAGE tensor of frames, for H3's ref_videos input."""
+    clip into an IMAGE tensor of frames, for H3's ref_videos input.
+
+    CORRECTED 2026-09-04: max_frames used to be a flat, unconditional 200-frame
+    ceiling regardless of the requested trim window or the source video's own fps
+    — confirmed the real root cause of an hours-long "the reference motion is only
+    followed for the first few seconds, then drifts" investigation. A 30fps source
+    trimmed to 10s needs 300 frames to cover the window; the old flat cap silently
+    stopped decoding at 200 frames (~6.67s), so the back third of every reference
+    video ever used here was simply never loaded into the tensor H3 received, no
+    matter what else (prompt wording, retention level, sampling settings, chunk
+    duration) got changed around it — none of those could have fixed it, since the
+    actual reference data was already incomplete before any of them came into
+    play. Now computes how many frames are actually needed to cover the requested
+    trim window at the source's own real fps, with a small margin for seek/decode
+    imprecision, instead of a flat number. Falls back to the old default only when
+    no explicit trim end is set (whole-rest-of-file) or the source fps can't be
+    read — bounded by a generous emergency ceiling so a mistaken very-long trim
+    can't try to decode an unbounded number of frames into memory.
+    """
     file_path = _resolve_path(entry.get("file", ""))
     if not file_path or not os.path.exists(file_path):
         log.warning("[MuseMinimaxDirector] Reference video not found: %s", entry.get("fileName", entry.get("file", "")))
         return None
     start_sec = float(entry.get("trimStartSec", 0) or 0)
     end_sec = entry.get("trimEndSec")
+    # CORRECTED 2026-09-04, second pass: the stock MiniMaxH3ReferenceToVideo node
+    # (comfy_extras/nodes_minimax_h3.py) treats whatever frames it's handed as an
+    # already-correctly-timed 24fps sequence — it does its own further truncation
+    # to `frame_count` (the target chunk's own frame count at 24fps) and VAE-
+    # encodes the result with no real-time-aware resampling at all. So just
+    # decoding "enough native-fps frames to cover the trim window" (the first pass
+    # at this fix) still isn't right for a source that isn't already 24fps: a
+    # 30fps clip's frames are 1/30s apart, not 1/24s, so the stock node's own
+    # truncation would both cut off short of the real window AND play the result
+    # back slower than the real reference (more raw frames packed into what H3
+    # treats as a shorter span of time). Resampling here to a genuine 24fps grid,
+    # driven by each decoded frame's real timestamp rather than the source's
+    # declared frame count, fixes both at once and is correct regardless of
+    # whether the source is 24, 30, or 60fps, or has an unreliable/variable rate.
+    TARGET_FPS = 24.0
+    frame_interval = 1.0 / TARGET_FPS
     frames = []
     try:
         with av.open(file_path) as container:
             stream = container.streams.video[0]
             stream.thread_type = "AUTO"
+            if end_sec is not None:
+                # +8 frames of margin: seek isn't frame-exact, and this stays
+                # generous well above H3's own documented 15s ref_video ceiling —
+                # only ever bites on a mistaken/corrupt case, never a real trim.
+                hard_cap = min(1800, int((float(end_sec) - start_sec) * TARGET_FPS) + 8)
+            else:
+                hard_cap = max_frames
             if stream.time_base:
                 seek_pts = int(max(0, start_sec - 0.5) / float(stream.time_base))
             else:
                 seek_pts = int(max(0, start_sec - 0.5) * av.time_base)
             container.seek(seek_pts, stream=stream, backward=True)
+            next_target_time = start_sec
             for frame in container.decode(stream):
                 frame_time = frame.time
                 if frame_time is None and frame.pts is not None and stream.time_base:
@@ -472,8 +781,16 @@ def _load_ref_video_tensor(entry: dict, max_frames: int = 200):
                     continue
                 if end_sec is not None and frame_time > float(end_sec):
                     break
-                frames.append(frame.to_ndarray(format="rgb24"))
-                if len(frames) >= max_frames:
+                # Emit this decoded frame for every 24fps target slot it covers —
+                # normally one, but if the source's own fps is below 24, the same
+                # frame correctly gets reused for more than one target slot rather
+                # than the output silently running short.
+                while frame_time >= next_target_time - 1e-6:
+                    frames.append(frame.to_ndarray(format="rgb24"))
+                    next_target_time += frame_interval
+                    if len(frames) >= hard_cap:
+                        break
+                if len(frames) >= hard_cap:
                     break
     except Exception as exc:
         log.warning("[MuseMinimaxDirector] Reference video decode error (%s): %s", entry.get("fileName", ""), exc)
@@ -555,7 +872,7 @@ def _build_character_subjects(tdata: dict, target_w: int, target_h: int, resize_
         tensor = _load_character_image(ch)
         if tensor is None:
             continue
-        tensor = _fit_image_to_target(tensor, target_w, target_h, resize_method)
+        tensor = _fit_reference_image(tensor, target_w, target_h, ch.get("fit", "original"))
         slot = len(ref_images)
         ref_images[f"ref_image_{slot}"] = tensor
         picture_n = slot + 1
@@ -570,6 +887,35 @@ def _build_character_subjects(tdata: dict, target_w: int, target_h: int, resize_
         retention_meta.append((subject_n, picture_n, retention))
 
     return ref_images, subject_lines, retention_meta, subject_number_by_char_index
+
+
+def _resolve_location_for_chunk(locations: list, chunk_number: int):
+    """Picks which Location image applies to a given chunk (1-indexed). Each
+    entry in `locations` carries its own `chunk` field — the entry assigned to
+    exactly this chunk wins; otherwise the most recent EARLIER assignment carries
+    forward (e.g. chunk 3 with no Location of its own reuses whatever chunk 1 or
+    2 last set), same carry-forward convention already used for style_line/
+    overall_soundscape/etc. elsewhere in this node. Falls back to the first
+    location in list order if nothing has been assigned at or before this chunk
+    yet — shouldn't normally happen (slot 0 always defaults to chunk 1) but stays
+    sane against an unusual saved timeline."""
+    if not locations:
+        return None
+    best = None
+    best_chunk = -1
+    for loc in locations:
+        if not loc or not (loc.get("file") or loc.get("image_b64")):
+            continue
+        loc_chunk = int(loc.get("chunk") or 1)
+        if loc_chunk <= chunk_number and loc_chunk > best_chunk:
+            best = loc
+            best_chunk = loc_chunk
+    if best is not None:
+        return best
+    for loc in locations:
+        if loc and (loc.get("file") or loc.get("image_b64")):
+            return loc
+    return None
 
 
 def _build_keyframe_alignment_line(has_first: bool, has_last: bool, last_shot_num: int, chunk_duration: float) -> str:
@@ -618,14 +964,21 @@ def _build_base_mode_shot_lines(chunk_segments: list, chunk_start_sec: float, di
         if not text:
             continue
         shot_idx += 1
-        speaker_idxs = _seg_speaker_indices(seg)
-        s_n = None
-        if len(speaker_idxs) == 1:
-            char_idx = speaker_idxs[0]
-            s_n = speaker_assign.setdefault(char_idx, len(speaker_assign) + 1)
-        text = _wrap_dialogue(text, dialogue_language)
-        if s_n and "<d>" in text:
-            text = text.rstrip() + f" (S{s_n})"
+        line_speakers = _seg_dialogue_speaker_indices(seg)
+        if line_speakers is not None:
+            text = _wrap_dialogue(
+                text, dialogue_language,
+                [(idx + 1) if isinstance(idx, int) else None for idx in line_speakers],
+            )
+        else:
+            speaker_idxs = _seg_speaker_indices(seg)
+            s_n = None
+            if len(speaker_idxs) == 1:
+                char_idx = speaker_idxs[0]
+                s_n = speaker_assign.setdefault(char_idx, len(speaker_assign) + 1)
+            text = _wrap_dialogue(text, dialogue_language)
+            if s_n and "<d>" in text:
+                text = text.rstrip() + f" (S{s_n})"
         if shot_idx == 1:
             shot_lines.append(f"[Shot 1] {text}")
         else:
@@ -693,13 +1046,21 @@ def _normalize_dialogue_text(text: str) -> str:
     return text
 
 
-def _wrap_dialogue(text: str, language: str) -> str:
+def _wrap_dialogue(text: str, language: str, speaker_ids: list | None = None) -> str:
     """Wraps every "..."-quoted span in a CUT's text as <d>[Language] ...</d>,
     the guide's required dialogue/lyric tag — leaves everything outside quotes
     (including any <Subject N>/<Picture N>/<Video N>/<Audio N> tags) untouched."""
+    quote_index = 0
     def _sub(m):
+        nonlocal quote_index
         inner = _normalize_dialogue_text(m.group(1))
-        return f"<d>[{language}] {inner}</d>"
+        tag = f"<d>[{language}] {inner}</d>"
+        if speaker_ids is not None and quote_index < len(speaker_ids):
+            speaker_id = speaker_ids[quote_index]
+            if isinstance(speaker_id, int) and speaker_id > 0:
+                tag += f" (S{speaker_id})"
+        quote_index += 1
+        return tag
     return _DIALOGUE_RE.sub(_sub, text)
 
 
@@ -749,6 +1110,26 @@ def _seg_speaker_indices(seg: dict) -> list:
     return [legacy] if legacy is not None else []
 
 
+def _seg_dialogue_speaker_indices(seg: dict):
+    """Speaker Ref index for each quoted span, or None for a legacy CUT."""
+    entries = seg.get("dialogueSpeakers")
+    if not isinstance(entries, list):
+        return None
+    result = []
+    for entry in entries:
+        idx = entry.get("speakerCharIdx") if isinstance(entry, dict) else entry
+        result.append(idx if isinstance(idx, int) and idx >= 0 else None)
+    return result
+
+
+def _seg_all_speaker_indices(seg: dict) -> list:
+    """Unique speakers used by per-line assignments, with legacy fallback."""
+    line_idxs = _seg_dialogue_speaker_indices(seg)
+    if line_idxs is None:
+        return _seg_speaker_indices(seg)
+    return list(dict.fromkeys(idx for idx in line_idxs if isinstance(idx, int)))
+
+
 def _build_summary_sentence(subject_tags: list, video_continuity_tag: str, carry_audio_tag: str) -> str:
     """One plain-English sentence naming the chunk's subjects — sits after the
     bracketed task-type prefix in the summary section. Deliberately simple
@@ -768,6 +1149,77 @@ def _build_summary_sentence(subject_tags: list, video_continuity_tag: str, carry
     if extras:
         base = base.rstrip(".") + ", " + ", ".join(extras) + "."
     return base
+
+
+_CHUNK_OVERRIDE_HEADER_RE = re.compile(
+    r'^[\-‐-―]{2,}\s*Chunk\s+(\d+)\s*/\s*(\d+)\b',
+    re.IGNORECASE,
+)
+
+
+def _select_chunk_from_prompt_override(prompt_override: str, chunk_idx: int, num_chunks: int) -> str:
+    """Only ever called from inside the use_prompt_override branch in execute() —
+    structurally cannot run, let alone change anything, when that toggle is off,
+    since the normal timeline-compiled chunk_prompt is already assigned earlier
+    in the same per-chunk loop and this function is never reached in that case.
+
+    Confirmed 2026-09-03: as originally written, use_prompt_override applied the
+    exact same literal string to every chunk of a multi-chunk render — there was
+    no way to give chunk 2 different text from chunk 1 through the socket. This
+    lets one prompt_override string carry different text per chunk instead, by
+    splitting on a '--- Chunk N/M ...' header line, one per chunk. Fully
+    backward-compatible: a prompt_override with no such header — the only
+    pattern that worked before this was added — is returned unchanged,
+    identically for every chunk, exactly as before.
+
+    CORRECTED 2026-09-03 (same day, real render test): the first version of this
+    matcher required an exact closing '--- Chunk N/M (~Xs) ---' shape via one
+    big anchored regex — it silently matched nothing at all against Andy's real
+    pasted override text (confirmed via the compiled_prompt output: both
+    chunks' full text, headers included, got duplicated into every chunk —
+    the exact symptom of the fallback firing when it shouldn't). Root cause
+    not fully isolated (likely dash-character or line-ending variance from
+    however the text reached the ComfyUI widget), so the fix is to stop
+    depending on the closing shape at all: match per LINE, only on the
+    OPENING '--- Chunk N/M' — any run of 2+ dash-like characters (plain
+    hyphen or a Unicode dash variant), 'Chunk', the two numbers — and ignore
+    whatever else is on that line (duration suffix, closing dashes, or
+    nothing). Far more tolerant of exactly the kind of formatting drift that
+    broke the original version.
+
+    When headers ARE present but don't cover every real chunk (e.g. the author
+    only wrote 2 explicit chunks but the render actually has 3), the last
+    provided chunk's text is reused for every chunk beyond that point, with a
+    log warning — better than silently falling back to raw undifferentiated
+    text (which would reintroduce the exact bug this function fixes) or
+    erroring out mid-render."""
+    lines = prompt_override.splitlines()
+    header_positions = []  # (line_index, chunk_n)
+    for i, line in enumerate(lines):
+        m = _CHUNK_OVERRIDE_HEADER_RE.match(line.strip())
+        if m:
+            header_positions.append((i, int(m.group(1))))
+
+    if not header_positions:
+        return prompt_override.strip()
+
+    segments = {}
+    for i, (line_i, chunk_n) in enumerate(header_positions):
+        seg_start = line_i + 1
+        seg_end = header_positions[i + 1][0] if i + 1 < len(header_positions) else len(lines)
+        segments[chunk_n] = "\n".join(lines[seg_start:seg_end]).strip()
+
+    target_n = chunk_idx + 1
+    if target_n in segments:
+        return segments[target_n]
+
+    highest_defined = max(segments.keys())
+    log.warning(
+        "[MuseMinimaxDirector] prompt_override has no '--- Chunk %d/%d ---' section for "
+        "this chunk — reusing chunk %d's text instead.",
+        target_n, num_chunks, highest_defined,
+    )
+    return segments[highest_defined]
 
 
 def _assemble_six_section_prompt(subject_lines: list, summary_line: str, retention_lines: list,
@@ -843,6 +1295,22 @@ def _bucket_segments_into_chunks(tdata: dict, duration_seconds: float, chunk_dur
     return buckets, chunk_lengths, bounds
 
 
+_LATENT_UPSCALE_MODEL_FOLDER = "latent_upscale_models"
+if _LATENT_UPSCALE_MODEL_FOLDER not in folder_paths.folder_names_and_paths:
+    folder_paths.add_model_folder_path(
+        _LATENT_UPSCALE_MODEL_FOLDER,
+        os.path.join(folder_paths.models_dir, _LATENT_UPSCALE_MODEL_FOLDER),
+    )
+
+
+def _scan_latent_upscale_models():
+    names = [
+        name for name in folder_paths.get_filename_list(_LATENT_UPSCALE_MODEL_FOLDER)
+        if os.path.splitext(name)[1].lower() in (".pth", ".safetensors")
+    ]
+    return names if names else [f"(place a model in ComfyUI/models/{_LATENT_UPSCALE_MODEL_FOLDER}/)"]
+
+
 def _two_stage_snap_upscale_target(cur_h_latent: int, cur_w_latent: int, scale_by: float):
     """Target latent H/W for the mid-sampling video-latent upscale, snapped to
     H3's own canvas grid (CANVAS_MULTIPLE=32 px, i.e. 2 latent units — 16x VAE
@@ -887,30 +1355,269 @@ def _two_stage_snap_upscale_target(cur_h_latent: int, cur_w_latent: int, scale_b
     return tgt_h_latent, tgt_w_latent, eff_scale_x, eff_scale_y
 
 
+def _rebuild_keyframe_conditioning_for_stage2(
+        positive, vae, chunk_first, chunk_last,
+        tgt_w_latent, tgt_h_latent, frame_count, guide_frames=None):
+    """First/Last-Frame and Hybrid mode's keyframe conditioning (minimax_keyframes) is
+    a real VAE-encoded latent baked into `positive` once, at Stage 1's resolution, by
+    MiniMaxH3ImageToVideo or MiniMaxH3HybridRefAndKeyframe — reusing it unchanged after
+    two-stage sampling's mid-run upscale is a genuine resolution mismatch, not a
+    cosmetic one: the model splices this latent directly into the video's own
+    per-frame rows (comfy/ldm/minimax/model.py's
+    `all_video_rows[~img_update] = cond_video_rows`), which needs an exact row-count
+    match to whatever resolution Stage 2 is actually running at. Confirmed as a real,
+    known issue via an independent MiniMax-H3 ComfyUI project (nkxx188/
+    ComfyUI-MiniMaxH3-Easy) that hit and fixed this exact crash the same way: re-resize
+    the ORIGINAL keyframe images (not the existing keyframe latent) to the new
+    resolution and re-encode fresh with the VAE — a full pixel-space re-resize +
+    re-encode, not a latent-space upscale of the already-encoded keyframe.
+
+    No-op (returns `positive` completely untouched) whenever there's no keyframe to
+    rebuild — Reference-mode chunks never have a chunk_first/chunk_last at all, so
+    this never touches Reference mode's own conditioning, and Hybrid mode's separate
+    minimax_refs (reference images/videos/audio) are left alone too — only the
+    keyframe portion is rebuilt, since reference-style conditioning isn't spliced into
+    fixed video rows the same way and has never shown this failure mode (confirmed
+    directly: plain Reference-mode two-stage renders complete fine tonight without any
+    equivalent rebuild for their own reference images).
+    """
+    if chunk_first is None and chunk_last is None and not guide_frames:
+        return positive
+    # ComfyUI's native MiniMaxH3ImageToVideo conditioning stores
+    # `minimax_keyframes`, but deliberately does not store its resolved frame count.
+    # The Director already owns the exact aligned per-chunk length that created the
+    # latent, so use that authoritative value directly. This also matches Seed Hunt
+    # Refine, which persists and restores the same per-chunk frame count alongside
+    # the original keyframe pixels before rebuilding them at Stage 2 resolution.
+    frame_count = int(frame_count)
+    if frame_count < 1:
+        raise ValueError(f"Invalid Stage 2 keyframe frame_count: {frame_count}")
+    tgt_w_px = int(tgt_w_latent) * 16
+    tgt_h_px = int(tgt_h_latent) * 16
+    new_keyframes = []
+    # Same resize convention MiniMaxH3ImageToVideo/MiniMaxH3HybridRefAndKeyframe
+    # themselves use: first_frame is a plain stretch-to-canvas geometry anchor,
+    # last_frame is an aspect-preserving center-crop follower — matched here so the
+    # Stage 2 re-encode frames identically to how Stage 1's keyframe did, just at the
+    # new resolution.
+    if chunk_first is not None:
+        img = _resize(chunk_first[:1], tgt_w_px, tgt_h_px, "disabled")
+        new_keyframes.append({"resolved_frame_index": 0, "latent": vae.encode(img)})
+    for guide in (guide_frames or []):
+        image = guide.get("image")
+        if image is None:
+            continue
+        img = _resize(image[:1], tgt_w_px, tgt_h_px, "center")
+        new_keyframes.append({"resolved_frame_index": int(guide["frame_idx"]), "latent": vae.encode(img)})
+
+    # Deliberately do not re-encode the supplied last frame at Stage 2. Stage 1 has
+    # already used it to shape the trajectory; imposing a fresh high-resolution copy
+    # here caused the generated approach to snap back to the source image near the end.
+    return node_helpers.conditioning_set_values(
+        positive, {"minimax_keyframes": new_keyframes, "minimax_frame_count": frame_count}
+    )
+
+
+def _latent_resize_ref_block(blk, tgt_w_latent, tgt_h_latent):
+    """Legacy-fallback path for one visual minimax_refs block: no original source
+    pixels are available to re-encode fresh, so just latent-space resize the
+    EXISTING (Stage-1-resolution) latent up to the Stage-2 canvas and correct its
+    latent_h/latent_w bookkeeping to match. This keeps the block's own metadata
+    self-consistent and raises its token density, but — unlike a fresh re-encode —
+    cannot recover any detail the Stage-1 encode never captured in the first place.
+    See _rebuild_refs_conditioning_for_stage2's own docstring for the full story."""
+    old_samples = blk["latent"]["samples"] if isinstance(blk["latent"], dict) else blk["latent"]
+    is_video = old_samples.dim() == 5  # [B, C, T, H, W] vs a plain image latent's [B, C, H, W]
+    if is_video:
+        b, c, t, h, w = old_samples.shape
+        flat = old_samples.movedim(2, 1).reshape(b * t, c, h, w)
+        flat = comfy.utils.common_upscale(flat, int(tgt_w_latent), int(tgt_h_latent), "bicubic", "disabled")
+        new_samples = flat.reshape(b, t, c, int(tgt_h_latent), int(tgt_w_latent)).movedim(1, 2)
+    else:
+        new_samples = comfy.utils.common_upscale(
+            old_samples, int(tgt_w_latent), int(tgt_h_latent), "bicubic", "disabled")
+    new_blk = dict(blk)
+    new_blk["latent"] = {"samples": new_samples} if isinstance(blk["latent"], dict) else new_samples
+    new_blk["latent_h"] = int(tgt_h_latent)
+    new_blk["latent_w"] = int(tgt_w_latent)
+    return new_blk
+
+
+def _rebuild_refs_conditioning_for_stage2(
+        positive, vae, tgt_w_latent, tgt_h_latent, ref_image_size="match",
+        chunk_ref_images=None, chunk_ref_videos=None):
+    """Stage 1's minimax_refs visual latents (reference images/videos baked into
+    `positive` once by MiniMaxH3ReferenceToVideo / MiniMaxH3HybridRefAndKeyframe) are
+    real VAE-encoded latents sized relative to Stage 1's generation resolution
+    (nodes_minimax_h3.py: image refs scale by sqrt((width*height)/(w*h)) against the
+    PASSED width/height — Stage 1's, never rebuilt for Stage 2's upscaled canvas).
+    Two-stage sampling's mid-run upscale enlarges the generated video latent but
+    leaves reference conditioning at that lower resolution — real reference detail
+    that Stage 1's lower-resolution encode never captured can't reach Stage 2 no
+    matter how many denoising steps run there. Confirmed via a real two-stage vs
+    single-stage render comparison (2026-09-02): two-stage skin comes out visibly
+    smoother/glossier ("plastic") than single-stage despite using the same
+    reference. This is NOT a RoPE coordinate-scale bug — comfy/ldm/minimax/model.py's
+    _frame_grid area-normalizes each block's own position span by its own
+    sqrt(latent_h*latent_w), so a block's coordinate extent is already invariant to
+    its own resolution — it's a genuine reference-detail/token-density shortfall.
+
+    Reference VIDEOS are deliberately left untouched here: adapt_canvas() (this
+    node's own video-ref sizing function) computes their target canvas purely from
+    the ref video's own width/height, capped at a fixed 768-short-edge/1344*768-area
+    ceiling — it never takes the generation's width/height as an input at all, so
+    re-running a video ref through it at Stage-1 vs Stage-2 dimensions produces the
+    identical result. Only image refs actually depend on the generation canvas
+    (ref_image_size == "match" scales by generation pixel area), so only image refs
+    have a real Stage-1-vs-Stage-2 gap to close.
+
+    Whenever the ORIGINAL reference image pixels used to build this chunk are still
+    in scope (chunk_ref_images — the same dict passed to MiniMaxH3ReferenceToVideo /
+    MiniMaxH3HybridRefAndKeyframe when the chunk was first built), each image ref
+    block is rebuilt from scratch: re-resized to the Stage-2 canvas with the exact
+    same sizing rule that node uses (nodes_minimax_h3.py's own image-ref loop, just
+    resolved against tgt_w_latent/tgt_h_latent*16 instead of Stage 1's width/height)
+    and freshly VAE-encoded. Falls back to _latent_resize_ref_block (a plain latent-
+    space resize of the existing latent) only when no original pixel is available
+    for a given block — logged distinctly, since that path cannot add real detail.
+
+    Audio-reference latents are always carried over completely unchanged — audio has
+    no spatial canvas to mismatch, and re-encoding it again would be wasted, and
+    potentially non-reproducible, work for no benefit. Reference ordering is
+    preserved exactly (blocks are rebuilt in place, one-for-one, never reordered),
+    so <Picture N>/<Video k>/<Audio j> prompt attribution cannot shift.
+
+    No-op (returns `positive` untouched) when there's no minimax_refs to rebuild at
+    all — pure First/Last-Frame chunks never carry any.
+    """
+    existing_refs = positive[0][1].get("minimax_refs") if positive else None
+    if not existing_refs:
+        return positive
+
+    # Original image pixels are consumed by position, in the exact order
+    # MiniMaxH3ReferenceToVideo/MiniMaxH3HybridRefAndKeyframe iterate
+    # chunk_ref_images.values() when building their own ref_blocks — the same
+    # order those blocks were originally appended in, so pairing by position here
+    # reproduces the original image<->block correspondence exactly.
+    orig_images = list((chunk_ref_images or {}).values())
+    tgt_w_px, tgt_h_px = int(tgt_w_latent) * 16, int(tgt_h_latent) * 16
+    img_cursor = 0
+    fresh_count, fallback_count = 0, 0
+    new_refs = []
+    for blk in existing_refs:
+        if blk.get("kind") != "image":
+            # Video/audio blocks pass through byte-for-byte unchanged — see this
+            # function's own docstring for why video refs need no Stage-2 rebuild.
+            new_refs.append(blk)
+            continue
+        src = orig_images[img_cursor] if img_cursor < len(orig_images) else None
+        img_cursor += 1
+        if src is None:
+            new_refs.append(_latent_resize_ref_block(blk, tgt_w_latent, tgt_h_latent))
+            fallback_count += 1
+            continue
+        h, w = src.shape[1], src.shape[2]
+        if ref_image_size == "match":
+            scale = min(1.0, math.sqrt((tgt_w_px * tgt_h_px) / (w * h)))
+        else:
+            scale = min(1.0, REF_IMAGE_SHORT_EDGE / min(w, h))
+        tw = max(CANVAS_MULTIPLE, round(w * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
+        th = max(CANVAS_MULTIPLE, round(h * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
+        resized = _resize(src[:1], tw, th, "disabled")
+        z = vae.encode(resized)
+        new_blk = dict(blk)
+        new_blk["latent_h"], new_blk["latent_w"], new_blk["latent"] = th // 16, tw // 16, z
+        new_refs.append(new_blk)
+        fresh_count += 1
+
+    if fresh_count:
+        log.info("[MuseMinimaxDirector] Stage 2: freshly re-encoded %d Stage-2 visual "
+                  "reference(s) from source pixels.", fresh_count)
+    if fallback_count:
+        log.info("[MuseMinimaxDirector] Stage 2: scaled %d existing reference latent(s) "
+                  "as legacy fallback (no original source pixels in scope).", fallback_count)
+
+    return node_helpers.conditioning_set_values(positive, {"minimax_refs": new_refs})
+
+
+def _video_only_carry_inject(latent, source_video_samples, carry_n: int):
+    """Backs vae_reencode_carry_video_only_test — a video-only carry variant,
+    proven out and confirmed working (2026-09-03) alongside vae_reencode_carry_test
+    and raw_latent_carry_test; all three are legitimate options now, not test/
+    diagnostic-only scaffolding. Copies ONLY the video-prefix-splice and video-mask math from
+    ComfyUI-H3-Motion-Context-MultiRef's own MiniMaxH3GeneratedAVMaskedContext.prepare()
+    (existing_video_extension.py), rather than calling that node, because that node
+    hard-requires BOTH video and audio streams in source_latent (_streams_from_latent
+    raises "expected joint H3 video+audio latent streams" otherwise) and always
+    overwrites both the audio latent values and its own noise mask whenever it runs —
+    there is no parameter on that node to carry video only. This function leaves the
+    target latent's own audio component and its noise mask completely untouched (H3
+    generates that audio fully fresh, no continuity anchor at all), while reproducing
+    the proven video-carry math exactly, so the video splice this test produces is
+    byte-for-byte the same as the real node would have produced for the video half.
+
+    carry_n is Director's OWN already-snapped frame count (align_frame_count, the
+    same "39/90/141..." grid the real node's own _snap_context_length enforces) —
+    NOT re-derived here, so alignment can never drift from the proven mechanism this
+    test exists to compare against. Built for a real, timed, reproduced symptom:
+    audio degrading right around a chunk boundary and never recovering afterward —
+    see this function's own call sites for the full diagnostic writeup."""
+    import comfy.nested_tensor
+    parts = latent["samples"].unbind()
+    target_video, target_audio = parts[0], parts[1]
+    if target_video.ndim == 4:
+        target_video = target_video.unsqueeze(0)
+    # Same pixel-run -> latent-temporal-step conversion the real node uses — a valid
+    # H3 pixel run and a valid protected-context run are both 2 mod 5 latent steps,
+    # so this is an exact (not approximate) inverse of align_frame_count's own grid.
+    video_steps = 2 + 5 * ((int(carry_n) - 5) // 17)
+    out_video = target_video.clone()
+    out_video[:, :, :video_steps] = source_video_samples[:, :, -video_steps:].to(
+        device=out_video.device, dtype=out_video.dtype)
+    video_mask = torch.ones(
+        (1, 1, int(out_video.shape[2]), int(out_video.shape[3]), int(out_video.shape[4])),
+        device=out_video.device, dtype=torch.float32,
+    )
+    video_mask[:, :, :video_steps] = 0.0
+    # Audio mask left at all-ones (nothing protected) and target_audio passed through
+    # unchanged — this is the literal "untouched" half of the test, not merely unused.
+    audio_mask = torch.ones(
+        (1, 1, int(target_audio.shape[2]), int(target_audio.shape[3])),
+        device=target_audio.device, dtype=torch.float32,
+    )
+    out = latent.copy()
+    out["samples"] = comfy.nested_tensor.NestedTensor((out_video, target_audio))
+    out["noise_mask"] = comfy.nested_tensor.NestedTensor((video_mask, audio_mask))
+    return out, int(carry_n)
+
+
 class MuseMinimaxDirector:
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "mode": ([MODE_REFERENCE, MODE_FIRST_LAST], {"default": MODE_REFERENCE}),
+                "mode": ([MODE_REFERENCE, MODE_FIRST_LAST, MODE_HYBRID], {"default": MODE_REFERENCE}),
                 "model": ("MODEL",),
                 "clip": ("CLIP",),
                 "vae": ("VAE",),
                 "audio_vae": ("VAE", {"tooltip": "Needed for final audio decode in both modes — H3 always builds a joint audio+video latent internally, even in First/Last Frame mode."}),
                 "aspect_ratio": (ASPECT_RATIO_OPTIONS, {"default": AspectRatio.WIDESCREEN_H.value}),
-                "megapixels": ("FLOAT", {"default": 0.98, "min": 0.1, "max": 4.0, "step": 0.02}),
-                "multiple": ("INT", {"default": 32, "min": 8, "max": 128, "step": 4, "advanced": True}),
-                "resize_method": (["crop", "pad", "stretch"], {"default": "crop", "tooltip":
+                # 0.98 is an official H3 guide value, so the backing Comfy widget
+                # must retain hundredth precision. The custom UI advances through
+                # the exact guide table rather than treating this as a 0.1 range.
+                "megapixels": ("FLOAT", {"default": 0.5, "min": 0.2, "max": 2.0, "step": 0.01}),
+                "multiple": ("INT", {"default": 32, "min": 8, "max": 128, "step": 8, "advanced": True}),
+                "resize_method": (["original", "crop", "pad", "stretch"], {"default": "original", "tooltip":
                     "How every character/background reference image and First/Last Frame image gets fit to "
                     "the output resolution when its own aspect ratio doesn't match. 'crop' scales up and "
                     "center-crops the excess (no distortion, may crop the edges of a person/scene). 'pad' "
                     "scales down to fit entirely within the frame and adds black bars (nothing cropped, but "
                     "the bars become visible reference content). 'stretch' resizes directly, distorting "
                     "proportions."}),
-                "duration_seconds": ("FLOAT", {"default": 10.0, "min": 1.0, "max": 120.0, "step": 0.5,
+                "duration_seconds": ("FLOAT", {"default": 15.0, "min": 1.0, "max": 900.0, "step": 0.5,
                     "tooltip": "Total length of the finished video. Automatically split into multiple H3 "
                                "generation calls if longer than chunk_duration_seconds, stitched together."}),
-                "chunk_duration_seconds": ("FLOAT", {"default": 10.0, "min": 3.0, "max": 15.0, "step": 0.5,
+                "chunk_duration_seconds": ("FLOAT", {"default": 15.0, "min": 3.0, "max": 15.0, "step": 0.5,
                     "tooltip": "Length of each individual H3 call. H3's own trained range tops out around "
                                "15s per call — longer totals get split into chunks this long (the final "
                                "chunk absorbs whatever's left over, so it may be shorter). Reference mode: "
@@ -919,7 +1626,7 @@ class MuseMinimaxDirector:
                                "instruction to continue seamlessly rather than cut. First/Last Frame mode: "
                                "continuation falls back to the previous chunk's last frame only."}),
                 "ref_image_size": (["match", "max"], {
-                    "default": "match",
+                    "default": "max",
                     "tooltip": "'match' scales references down to the generation's pixel area (faster). "
                                "'max' keeps up to a 2048px short edge for stronger identity fidelity, but "
                                "reference tokens ride every sampling step so it's several times slower. "
@@ -945,8 +1652,10 @@ class MuseMinimaxDirector:
                     "cross-dissolve — a plain alpha blend doesn't know the camera moved and ghosts instead "
                     "of smoothing. Replaces rather than inserts so total output length never changes and "
                     "audio can never drift out of sync with it. 0 disables it (hard cut)."}),
-                "vae_reencode_carry_test": ("BOOLEAN", {"default": False, "tooltip":
-                    "TEST. Any mode, 2+ chunks (same scope as the plain anchor mechanism it replaces). "
+                "vae_reencode_carry_test": ("BOOLEAN", {"default": True, "tooltip":
+                    "Any mode, 2+ chunks (same scope as the plain anchor mechanism it replaces). Proven "
+                    "out and confirmed working (2026-09-03) — on by default now, a real option, not a "
+                    "test/experimental one. "
                     "Replaces the plain first-frame-anchor continuity (_KEYFRAME_INJECTION_FRAMES discard) "
                     "with LTX Director's own mechanism: the "
                     "previous chunk's actual final vae_reencode_carry_length frames of decoded output "
@@ -966,70 +1675,160 @@ class MuseMinimaxDirector:
                     "snapped internally to H3's own valid video-VAE / audio-clock grid (39 is both a valid "
                     "H3 run and the shared audio boundary, matching MiniMaxH3GeneratedAVMaskedContext's own "
                     "default)."}),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
                 "seed_hunt": ("BOOLEAN", {"default": False, "tooltip":
                     "When on, runs 4 full passes total — identical settings, only the seed differs — and "
                     "fills the candidate_1..4 outputs (candidate_1 is always the main seed; 2-4 use seed + "
                     "N*1,000,003). Wire candidate_1..4_images/audio into MuseMinimaxRefine to pick one and "
                     "refine it at higher resolution. Takes ~4x as long as a single run — set megapixels low "
                     "here for cheap scouting, then refine at full resolution downstream."}),
-                "use_prompt_override": ("BOOLEAN", {"default": False, "tooltip":
-                    "When on, every chunk's prompt is replaced with whatever's wired into prompt_override, "
-                    "exactly as typed — the timeline's characters/CUTs/soundscape are ignored for prompt "
-                    "purposes (reference images, sampling, and chunking still work normally). For someone "
-                    "who already has a fully-formatted H3 prompt and wants to skip the Director's own "
-                    "compiler entirely, same as typing directly into the stock node's prompt box."}),
-                "steps": ("INT", {"default": 20, "min": 1, "max": 100}),
-                "sampler_name": (["res_multistep", "euler", "euler_ancestral", "dpmpp_2m"], {"default": "res_multistep"}),
-                "scheduler": (["simple", "normal", "beta", "sgm_uniform"], {"default": "simple"}),
-                "two_stage_sampling": ("BOOLEAN", {"default": False, "tooltip":
-                    "Experimental. Runs the first few steps at a lower resolution, upscales the "
+                "use_prompt_override": ("BOOLEAN", {"default": True, "tooltip":
+                    "When on, every chunk's prompt is replaced with whatever's wired into prompt_override — "
+                    "the timeline's characters/CUTs/soundscape are ignored for prompt purposes (reference "
+                    "images, sampling, and chunking still work normally). For someone who already has a "
+                    "fully-formatted H3 prompt and wants to skip the Director's own compiler entirely, same "
+                    "as typing directly into the stock node's prompt box. For a multi-chunk render, split "
+                    "prompt_override into one section per chunk with a '--- Chunk N/M ---' header line "
+                    "(same format this node's own compiled_prompt output uses) — each chunk then gets only "
+                    "its own section; with no such headers, the whole string is used as-is for every chunk, "
+                    "same as before this per-chunk splitting existed."}),
+                "steps": ("INT", {"default": 10, "min": 1, "max": 100}),
+                "sampler_name": (list(comfy.samplers.KSampler.SAMPLERS), {"default": "euler"}),
+                "scheduler": (list(dict.fromkeys(
+                    ["simple", "normal", "beta", "sgm_uniform"]
+                    + list(comfy.samplers.KSampler.SCHEDULERS)
+                )), {"default": "beta"}),
+                "two_stage_sampling": ("BOOLEAN", {"default": True, "tooltip":
+                    "On by default. Runs the first few steps at a lower resolution, upscales the "
                     "video latent directly (no VAE round-trip), then finishes the remaining steps "
-                    "at full resolution on the same continuous noise schedule. Off keeps today's "
-                    "single-pass behavior exactly as-is."}),
-                "two_stage_first_pass_steps": ("INT", {"default": 2, "min": 1, "max": 6, "tooltip":
+                    "at full resolution on the same continuous noise schedule. Off keeps the older "
+                    "single-pass behavior."}),
+                "two_stage_first_pass_steps": ("INT", {"default": 6, "min": 1, "max": 50, "step": 1, "tooltip":
                     "How many of the total steps run at the lower resolution before the upscale. "
-                    "2 is the reference workflow's own saved default (2-3 is the tested range); "
-                    "more than 3 risks the low-res pass locking in a broken composition before "
-                    "the upscale can recover it."}),
-                "two_stage_upscale_factor": ("FLOAT", {"default": 1.5, "min": 1.0, "max": 2.0, "step": 0.05, "tooltip":
-                    "How much larger the second pass renders vs the first. The reference workflow's own "
-                    "working note calls 1.3-1.5x the stable range — above that it warns of visible line/"
-                    "texture artifacts needing careful tuning, even though up to 2.0x is technically allowed. "
-                    "Actual applied value is snapped to H3's own valid resolution grid, so the true scale may "
-                    "differ slightly from this number — check the log for the exact value used."}),
-                "two_stage_upscale_method": (["nearest-exact", "bilinear", "area", "bicubic", "bislerp"], {"default": "nearest-exact"}),
+                    "6 is the confirmed shipped default (2026-09-03). Cap raised from 6 to 50 "
+                    "(2026-09-02) so higher Stage-1 step counts (another public H3 workflow uses "
+                    "8-15) can actually be tested — clamped internally to steps-1 either way, so "
+                    "setting this above your own 'steps' total just uses everything up to the last "
+                    "step, not an error."}),
+                "two_stage_latent_upscale_model": (_scan_latent_upscale_models(), {"tooltip":
+                    "Which trained latent-upscale checkpoint to use (from "
+                    "ComfyUI/models/latent_upscale_models/). Real learned network, not interpolation."}),
+                "two_stage_target_megapixels": ("FLOAT", {"default": 1.0, "min": 0.2, "max": 2.0, "step": 0.01, "tooltip":
+                    "Target resolution for the Stage-2 upscale, in megapixels. Aspect ratio is preserved "
+                    "and the result is aligned to MiniMax H3's 32-pixel canvas grid."}),
                 "two_stage_seed_hunt_latent_only": ("BOOLEAN", {"default": False, "tooltip":
                     "For scouting with Seed Hunt: stops each pass after Stage 1 instead of also running "
                     "the expensive Stage 2 upscale for all 4 candidates. images/audio become a cheap "
                     "low-res preview of Stage 1 only; the real, continuable Stage 1 latent is exposed on "
                     "the candidate_N_latent outputs — wire those into Muse Minimax Refine V1.2, pick your "
                     "favorite there, and only that one pays the Stage 2 cost."}),
-                "shift_video": ("FLOAT", {"default": 12.0, "min": 0.01, "max": 100.0, "step": 0.01, "advanced": True}),
-                "shift_audio": ("FLOAT", {"default": 3.0, "min": 0.01, "max": 100.0, "step": 0.01, "advanced": True}),
+                "shift_video": ("FLOAT", {"default": 12.0, "min": 0.0, "max": 100.0, "step": 1.0, "advanced": True}),
+                "shift_audio": ("FLOAT", {"default": 3.0, "min": 0.0, "max": 100.0, "step": 1.0, "advanced": True}),
                 "timeline_data": ("STRING", {"default": "{}", "multiline": False}),
                 # Appended after timeline_data (the last pre-existing required widget)
                 # deliberately — ComfyUI restores a saved workflow's widgets_values by
                 # position, not by name, so any new required widget must go at the very
                 # end or every widget after it silently misaligns on old saved workflows.
-                # Replaces the old all-or-nothing seed_hunt toggle with independent
-                # per-candidate control (ported from the proven MuseMinimaxDirector-
-                # SeedHuntToggle-Test node); seed_hunt itself stays put, untouched
-                # position, hidden from the panel, purely so an old workflow that had it
-                # on keeps running all 3 extra passes exactly as before. Orthogonal to
-                # two_stage_seed_hunt_latent_only — that decides what each pass that
-                # runs actually does (stop after Stage 1 or not); these decide which
-                # passes run at all. Neither reads the other.
-                "candidate_2": ("BOOLEAN", {"default": False, "tooltip":
-                    "Runs one extra full pass (identical settings, seed + 1,000,003) and fills the "
-                    "candidate_2 output. Independent of Candidate 3/4 — turn on only the ones you want "
-                    "to pay for."}),
-                "candidate_3": ("BOOLEAN", {"default": False, "tooltip":
-                    "Runs one extra full pass (identical settings, seed + 2,000,006) and fills the "
-                    "candidate_3 output. Independent of Candidate 2/4."}),
-                "candidate_4": ("BOOLEAN", {"default": False, "tooltip":
-                    "Runs one extra full pass (identical settings, seed + 3,000,009) and fills the "
-                    "candidate_4 output. Independent of Candidate 2/3."}),
+                # Replaces the old all-or-nothing seed_hunt toggle, AND the short-lived
+                # independent-per-candidate booleans that replaced it in turn — those
+                # let you tick e.g. only Candidate 4 and skip 2/3, which is meaningless
+                # (candidates are just different random seeds; there's no reason to want
+                # #4 specifically without #2/#3) and reads exactly backwards: "Candidate 4"
+                # looks like "give me 4" but actually meant "just slot 4, alone". A single
+                # count is the only thing a seed-hunt run can actually mean. seed_hunt
+                # itself stays put, untouched position, hidden from the panel, purely so
+                # an old workflow that had it on keeps running all 3 extra passes exactly
+                # as before. Orthogonal to two_stage_seed_hunt_latent_only — that decides
+                # what each pass that runs actually does (stop after Stage 1 or not); this
+                # decides how many passes run at all. Neither reads the other.
+                # enable_seed_hunt is the one thing that decides which of the two run
+                # shapes this is — NOT candidate_count. With it off: exactly one pass,
+                # full stop, main images/audio carry the real result (routes to a plain
+                # single-pass consumer downstream, e.g. a normal Save/Preview node) —
+                # candidate_count is completely ignored in this state, whatever it's
+                # left set to. With it on: candidate_count (1-4) picks how many
+                # candidates that scouting run covers, main images/audio are blocked
+                # (this is a scouting run, not a finished pick — see candidate_1..4
+                # instead), and even candidate_count=1 counts as a real Seed Hunt
+                # session, not a fallback to the plain single-pass behavior. Confirmed
+                # directly: candidate_count alone deciding this was a real, reported
+                # problem — nothing in the UI told you a plain number was secretly
+                # rerouting which output socket carries real data, and "the count
+                # controls whether Seed Hunt runs at all" isn't how anyone reads a
+                # count control in the first place.
+                "enable_seed_hunt": ("BOOLEAN", {"default": False, "tooltip":
+                    "Off: exactly one normal run, full stop — candidate_count below is ignored. "
+                    "On: runs a Seed Hunt scouting session using candidate_count candidates."}),
+                "candidate_count": (["1", "2", "3", "4"], {"default": "1", "tooltip":
+                    "Only used when Enable Seed Hunt (above) is on. How many candidates to scout — "
+                    "always candidates 1 through N in sequence (never a gap), seed + N*1,000,003 per "
+                    "extra pass — filling that many candidate_N outputs. Each extra candidate is one "
+                    "more full pass, so 4 takes ~4x as long as 1; set megapixels low here for cheap "
+                    "scouting, then refine your favorite at full resolution downstream."}),
+                # Appended here — the true END of "required" — not back where it's
+                # discussed (next to vae_reencode_carry_length). This node restores an
+                # old saved workflow's widgets_values BY POSITION, not by name — a new
+                # required widget inserted mid-list shifts every widget after it, and a
+                # real user hit exactly that (a blank/reset workflow) from an earlier,
+                # wrongly-positioned version of this same toggle. Appending at the very
+                # end (matching enable_seed_hunt/candidate_count just above, and given a
+                # matching Python default in execute() below) is what keeps every
+                # existing saved workflow's widgets_values still landing on the right
+                # widget after this one is added.
+                "vae_reencode_carry_video_only_test": ("BOOLEAN", {"default": False, "tooltip":
+                    "Only used when vae_reencode_carry_test is also on. Proven out and confirmed working "
+                    "(2026-09-03) — a real option, not a test/diagnostic-only one. Use it when you want the "
+                    "proven video-continuity splice across a chunk boundary WITHOUT carrying the previous "
+                    "chunk's audio into the next one — same video-prefix/video-mask math, same carry_n/"
+                    "alignment, same post-generation trim as vae_reencode_carry_test's own video half. The "
+                    "difference: chunk 2's own audio latent and its noise mask are left completely untouched "
+                    "(H3 generates that audio fully fresh, no continuity anchor) instead of going through "
+                    "MiniMaxH3GeneratedAVMaskedContext's own audio re-encode+splice. Originally built to "
+                    "isolate a reported audio-degradation symptom from the video carry — turning this on "
+                    "confirmed the audio re-encode/splice as the cause, so it's also the right toggle whenever "
+                    "you specifically want fresh audio per chunk with continuous video."}),
+                "long_form_enabled": ("BOOLEAN", {"default": False, "tooltip":
+                    "Lip Sync only. Saves a named project, completed chunks, and the latest continuation checkpoint to persistent disk storage."}),
+                "long_form_project_id": ("STRING", {"default": "", "multiline": False}),
+                "render_chunk_start": ("INT", {"default": 1, "min": 1, "max": 999, "step": 1}),
+                "render_chunk_end": ("INT", {"default": 999, "min": 1, "max": 999, "step": 1}),
+                # Appended here, at the true end of "required" — same positional-restore
+                # reasoning as vae_reencode_carry_video_only_test/enable_seed_hunt above:
+                # a new required widget must go last or every widget after it silently
+                # misaligns on an old saved workflow. Previously hardcoded True inside the
+                # Stage-2 MinimaxH3LatentUpscaler3D call with no way to turn it off — a
+                # real comparison against another H3 workflow found it off there, and
+                # temporal chunking's own internal overlap-blend is a plausible source of
+                # softened detail across each chunk's own internal boundaries (separate
+                # from, and in addition to, the cross-chunk carry mechanism). Default True
+                # keeps every existing saved workflow's behavior identical until someone
+                # deliberately turns this off to test the difference.
+                "two_stage_enable_temporal_chunking": ("BOOLEAN", {"default": False, "tooltip":
+                    "Only used when two_stage_sampling is on. The Stage-2 latent upscaler "
+                    "(MinimaxH3LatentUpscaler3D) internally splits long chunks into overlapping "
+                    "temporal pieces and blends them, rather than upscaling the whole chunk as one "
+                    "piece. Off (default, confirmed 2026-09-03) upscales the whole chunk in one "
+                    "piece — slower/more VRAM, but skips the internal overlap-blend. On splits into "
+                    "overlapping temporal pieces instead — this node's older always-on behavior."}),
+                # Ported from the Beta Director's own raw_latent_carry_test (2026-09-02) —
+                # appended here, at the true end of "required", same positional-restore
+                # reasoning as every other widget added after this node shipped. Now
+                # confirmed working (2026-09-03) and, along with vae_reencode_carry_test,
+                # defaults to on for every fresh node going forward — this only affects
+                # newly-created node instances; an existing saved workflow keeps whatever
+                # value it already has stored, this default never overrides that.
+                "raw_latent_carry_test": ("BOOLEAN", {"default": True, "tooltip":
+                    "Any mode, 2+ chunks. Proven out and confirmed working (2026-09-03) — on by default "
+                    "now, a real option, not an experimental one. Takes priority over vae_reencode_carry_test "
+                    "when both are on (mutually exclusive per chunk, not stacked). Copies the "
+                    "previous chunk's own raw final sampled AV latent straight into this chunk's "
+                    "opening vae_reencode_carry_length frames and hard-freezes them via "
+                    "MiniMaxH3GeneratedAVMaskedContext — no VAE decode/re-encode round trip for "
+                    "that carried window, unlike vae_reencode_carry_test. Ported from the Beta "
+                    "Director, where it was confirmed to hold room/prop geometry across a cut "
+                    "better than conditioning-only approaches. No guarantee content past the "
+                    "carried window won't still drift — this only makes the boundary itself a "
+                    "hard constraint instead of a soft one."}),
             },
             "optional": {
                 "model_fl2va": ("MODEL", {"tooltip": "The separate First/Last-Frame checkpoint (not the same "
@@ -1050,11 +1849,23 @@ class MuseMinimaxDirector:
 
     RETURN_TYPES = ("IMAGE", "AUDIO", "STRING", "IMAGE",
                      "IMAGE", "AUDIO", "IMAGE", "AUDIO", "IMAGE", "AUDIO", "IMAGE", "AUDIO",
-                     "LATENT", "LATENT", "LATENT", "LATENT")
+                     "LATENT", "LATENT", "LATENT", "LATENT",
+                     "AUDIO", "AUDIO", "AUDIO")
     RETURN_NAMES = ("images", "audio", "compiled_prompt", "ref_images_used",
                      "candidate_1_images", "candidate_1_audio", "candidate_2_images", "candidate_2_audio",
                      "candidate_3_images", "candidate_3_audio", "candidate_4_images", "candidate_4_audio",
-                     "candidate_1_latent", "candidate_2_latent", "candidate_3_latent", "candidate_4_latent")
+                     "candidate_1_latent", "candidate_2_latent", "candidate_3_latent", "candidate_4_latent",
+                     # Appended at the end (not interleaved with the outputs above) so
+                     # loading an older saved workflow doesn't shift any existing
+                     # position-wired output. Whichever reference audio clips actually
+                     # fed this run — Ref Audio 1/2/3, regardless of retention mode
+                     # (Voice Reference/Lip Sync/Partial Voice Match/Weak Reference all
+                     # equally count; retention only changes the compiled prompt's own
+                     # wording, never whether a clip is actually used) — so Refine V1.3
+                     # can reuse the exact same voice lock during its own refine pass,
+                     # the same reasoning ref_images_used already exists for images.
+                     # None for whichever Ref Audio slots weren't filled.
+                     "ref_audio_1_used", "ref_audio_2_used", "ref_audio_3_used")
     FUNCTION = "execute"
     CATEGORY = "Muse Collective"
 
@@ -1062,65 +1873,111 @@ class MuseMinimaxDirector:
                 duration_seconds, chunk_duration_seconds, ref_image_size, hybrid_continuation, seam_interpolation_frames,
                 vae_reencode_carry_test, vae_reencode_carry_length,
                 seed, seed_hunt, use_prompt_override, steps, sampler_name, scheduler,
-                two_stage_sampling, two_stage_first_pass_steps, two_stage_upscale_factor,
-                two_stage_upscale_method, two_stage_seed_hunt_latent_only, shift_video, shift_audio,
-                timeline_data, candidate_2=False, candidate_3=False, candidate_4=False,
+                two_stage_sampling, two_stage_first_pass_steps, two_stage_latent_upscale_model,
+                two_stage_target_megapixels, two_stage_seed_hunt_latent_only, shift_video, shift_audio,
+                timeline_data, enable_seed_hunt=False, candidate_count="1",
+                vae_reencode_carry_video_only_test=False,
+                long_form_enabled=False, long_form_project_id="", render_chunk_start=1, render_chunk_end=999,
+                two_stage_enable_temporal_chunking=False, raw_latent_carry_test=True,
                 model_fl2va=None, prompt_override=None):
         tdata = _parse_timeline(timeline_data)
         # Resolved before any reference image is loaded — every character/background/
         # First-Last-Frame image gets fit to this exact resolution via resize_method,
         # rather than leaving an aspect-ratio mismatch to whatever H3 does internally.
         width, height = _resolve_resolution(aspect_ratio, megapixels, multiple)
+        shared_tdata = tdata
+        if mode == MODE_HYBRID:
+            shared_tdata = dict(tdata)
+            shared_tdata["characters"] = [
+                entry for entry in (tdata.get("characters") or [])
+                if entry and entry.get("shared")
+            ]
         char_ref_images, subject_lines, subject_retention_meta, subject_number_by_char_index = _build_character_subjects(
-            tdata, width, height, resize_method)
+            shared_tdata, width, height, resize_method)
         subject_count = len(subject_lines)
         dialogue_language = (tdata.get("dialogue_language") or "English").strip() or "English"
-        background = tdata.get("background")
-        # First/Last Frame mode has no sockets of its own — Ref 1 / Ref 2 (the same
-        # upload UI every other reference uses) double as first_frame/last_frame. Read
-        # these directly from the raw characters list by literal slot position, NOT via
-        # char_ref_images — that dict is now densely fill-order-packed (see its own
-        # docstring), so "ref_image_0" there means "whichever slot was filled first",
-        # not "literally Ref 1". First/Last Frame mode has no <Picture N> tagging at all
-        # (ImageToVideo takes first_frame/last_frame directly), so there's no tag-order
-        # concern here — Ref 1 must always mean Ref 1.
-        characters_raw = tdata.get("characters", [])
-        first_frame = _load_character_image(characters_raw[0]) if len(characters_raw) > 0 and characters_raw[0] else None
-        first_frame = _fit_image_to_target(first_frame, width, height, resize_method)
-        last_frame = _load_character_image(characters_raw[1]) if len(characters_raw) > 1 and characters_raw[1] else None
-        last_frame = _fit_image_to_target(last_frame, width, height, resize_method)
-        # Background/continuity-anchor slot: the next free dense position after however
-        # many character images actually made it into char_ref_images — NOT a fixed index
-        # — same reasoning as _build_character_subjects: H3 tags by iteration order, so
-        # this must land wherever the character images actually stopped, not at a fixed
-        # slot number that only happens to be correct when all 9 character slots are full.
+        locations = [
+            entry for entry in (tdata.get("locations") or [])
+            if mode != MODE_HYBRID or (entry and entry.get("shared"))
+        ]
+        guide_entries = []
+        # First/Last Frame and Hybrid modes both now have their own independent
+        # First Frame / Last Frame storage (firstFrameImage/lastFrameImage) — they
+        # no longer borrow Ref 1/Ref 2 the way First/Last Frame mode used to. The
+        # underlying H3 nodes already keep first_frame/last_frame on a completely
+        # separate conditioning channel from ref_images (minimax_keyframes vs
+        # minimax_refs — confirmed directly from MiniMaxH3ImageToVideo's own
+        # inputs), so there was never an actual need to double them up with the
+        # character reference slots; that was only ever a Director UI shortcut.
+        first_frame = None
+        last_frame = None
+        if mode in (MODE_FIRST_LAST, MODE_HYBRID):
+            first_frame_entry = tdata.get("firstFrameImage") or {}
+            last_frame_entry = tdata.get("lastFrameImage") or {}
+            first_frame = _fit_image_to_target(_load_character_image(first_frame_entry) if first_frame_entry else None, width, height, resize_method)
+            last_frame = _fit_image_to_target(_load_character_image(last_frame_entry) if last_frame_entry else None, width, height, resize_method)
+        # Extra-slot start: the next free dense position after however many
+        # character images actually made it into char_ref_images — NOT a fixed
+        # index, same reasoning as _build_character_subjects: H3 tags by iteration
+        # order, so this must land wherever the character images actually
+        # stopped, not at a fixed slot number that only happens to be correct
+        # when all MAX_CHARACTER_SLOTS character slots are full. Two independent
+        # things can occupy slots from here on a continuation chunk — the
+        # last-frame anchor and this chunk's own Location — see the main
+        # per-chunk loop below.
         bg_index = len(char_ref_images)
 
         # Static reference-image set actually used for <Picture N> tagging on this run's
-        # first chunk (character/product photos + background, same dense fill order
+        # first chunk (character/product photos + Location, same dense fill order
         # MiniMaxH3ReferenceToVideo assigns Picture numbers by) — exposed as a real output
         # so MuseMinimaxRefine can reuse the exact same reference photos for identity/prop
         # lock during its own refine pass, instead of the user re-uploading them via
         # separate LoadImage nodes. Only meaningful in Reference (Omni) mode — First/Last
         # Frame mode has no <Picture N> tagging at all. Matches chunk 1's own composition
-        # specifically (see the `elif background and (...)` branch below) since Refine only
-        # ever operates on a single H3-call-length candidate, never a later continuation chunk.
+        # specifically (chunk 1 never has a last-frame anchor) since Refine only ever
+        # operates on a single H3-call-length candidate, never a later continuation chunk.
         ref_images_used_list = []
-        if mode == MODE_REFERENCE:
+        if mode in (MODE_REFERENCE, MODE_HYBRID):
             ref_images_used_list.extend(char_ref_images.values())
-            if background and (background.get("file") or background.get("image_b64")):
-                bg_tensor = _load_character_image(background)
-                if bg_tensor is not None:
-                    bg_tensor = _fit_image_to_target(bg_tensor, width, height, resize_method)
-                    ref_images_used_list.append(bg_tensor)
-        ref_images_used = torch.cat(ref_images_used_list, dim=0) if ref_images_used_list else torch.zeros((0, height, width, 3))
+            chunk1_location = _resolve_location_for_chunk(locations, 1)
+            if chunk1_location:
+                loc_tensor = _load_character_image(chunk1_location)
+                if loc_tensor is not None:
+                    loc_tensor = _fit_reference_image(loc_tensor, width, height, chunk1_location.get("fit", "original"))
+                    ref_images_used_list.append(loc_tensor)
+        ref_images_used = torch.cat(
+            [_fit_image_to_target(t, width, height, "pad") for t in ref_images_used_list], dim=0
+        ) if ref_images_used_list else torch.zeros((0, height, width, 3))
 
         buckets, chunk_lengths, chunk_bounds = _bucket_segments_into_chunks(tdata, duration_seconds, chunk_duration_seconds)
         num_chunks = len(buckets)
+        long_form_enabled = bool(long_form_enabled)
+        render_start_idx = max(0, min(num_chunks - 1, int(render_chunk_start) - 1))
+        render_end_idx = max(render_start_idx, min(num_chunks - 1, int(render_chunk_end) - 1))
+        all_audio_entries = list(tdata.get("refAudios") or [])
+        for _chunk in (tdata.get("chunks") or []):
+            all_audio_entries.extend(_chunk.get("localRefAudios") or [])
+        has_lip_sync = any(
+            entry and entry.get("file") and (entry.get("retention") or "reference") == "fully_copy"
+            for entry in all_audio_entries
+        )
+        if long_form_enabled:
+            if mode not in (MODE_REFERENCE, MODE_HYBRID) or not has_lip_sync:
+                raise ValueError("Long-Form Resume is available only for Reference/Hybrid Lip Sync renders.")
+            if enable_seed_hunt:
+                raise ValueError("Long-Form Resume cannot be combined with Seed Hunt.")
+            _read_project(long_form_project_id)
+        else:
+            render_start_idx, render_end_idx = 0, num_chunks - 1
+        # 1-4, clamped defensively — a COMBO widget can't submit anything outside its
+        # own option list, but int() on a stray/old value is one line of insurance.
+        # Meaningless (and ignored below) whenever enable_seed_hunt is off — always
+        # exactly 1 real candidate in that state, whatever this widget is left set to.
+        candidate_total = max(1, min(4, int(candidate_count))) if enable_seed_hunt else 1
 
         log.info(
-            "[MuseMinimaxDirector] mode=%s, %dx%d, seed=%d, candidates=%d, %d chunk(s): %s (total %.1fs)",
-            mode, width, height, seed, 1 + sum([candidate_2, candidate_3, candidate_4]), num_chunks,
+            "[MuseMinimaxDirector] mode=%s, %dx%d, seed=%d, seed_hunt=%s, candidates=%d, %d chunk(s): %s (total %.1fs)",
+            mode, width, height, seed, enable_seed_hunt, candidate_total, num_chunks,
             ", ".join(f"~{c:.1f}s" for c in chunk_lengths), sum(chunk_lengths),
         )
 
@@ -1137,11 +1994,27 @@ class MuseMinimaxDirector:
         DisableNoise = NODE_CLASS_MAPPINGS["DisableNoise"] if two_stage_sampling else None
         LTXVSeparateAVLatent = NODE_CLASS_MAPPINGS["LTXVSeparateAVLatent"] if two_stage_sampling else None
         LTXVConcatAVLatent = NODE_CLASS_MAPPINGS["LTXVConcatAVLatent"] if two_stage_sampling else None
+        MinimaxH3LatentUpscaler3D = None
+        if two_stage_sampling:
+            MinimaxH3LatentUpscaler3D = NODE_CLASS_MAPPINGS.get("MinimaxH3LatentUpscaler3D")
+            if MinimaxH3LatentUpscaler3D is None:
+                raise RuntimeError(
+                    "two_stage_sampling is on but 'MinimaxH3LatentUpscaler3D' isn't registered — "
+                    "install Comfyui_Minimax_h3_latent_Upscaler into custom_nodes."
+                )
+            if not two_stage_latent_upscale_model or str(two_stage_latent_upscale_model).startswith("("):
+                raise RuntimeError(
+                    "two_stage_sampling is on but no trained latent-upscale model is selected — "
+                    "place a checkpoint in ComfyUI/models/latent_upscale_models/."
+                )
         # Optional — only used for seam_interpolation_frames. Unlike the nodes above,
         # this comes from a third-party pack (ComfyUI-Frame-Interpolation), so it may
         # not be installed; looked up with .get() rather than [...] and handled at the
         # call site with a warning + hard-cut fallback rather than crashing the run.
         RIFE_VFI = NODE_CLASS_MAPPINGS.get("RIFE VFI")
+        # Lip Sync / fully_copy only. The installed Motion Context repository
+        # supplies exact master-song grid masking plus independent visual context.
+        MiniMaxH3SongMaskedAVContext = NODE_CLASS_MAPPINGS.get("MiniMaxH3SongMaskedAVContext")
         # vae_reencode_carry_test only — VAEEncode is stock core, always safe to grab.
         # VAEEncodeAudio is also stock core but only needed for this test, and
         # MiniMaxH3GeneratedAVMaskedContext comes from the separately-cloned
@@ -1180,7 +2053,7 @@ class MuseMinimaxDirector:
         if mode == MODE_REFERENCE and hybrid_continuation and model_fl2va is None:
             log.warning("[MuseMinimaxDirector] hybrid_continuation is on but model_fl2va isn't connected — "
                         "falling back to normal Reference (Omni) continuity for every chunk.")
-        elif mode == MODE_FIRST_LAST and model_fl2va is None:
+        elif mode in (MODE_FIRST_LAST, MODE_HYBRID) and model_fl2va is None:
             log.warning("[MuseMinimaxDirector] First/Last Frame mode has no model_fl2va connected — falling "
                         "back to the main model input, which should normally hold the Reference/ref2va "
                         "checkpoint, not the First/Last-Frame one. Results may be degraded; wire the fl2va "
@@ -1192,8 +2065,10 @@ class MuseMinimaxDirector:
         # chunking carry-over below (reserved slot 0 on continuation chunks), so both are
         # merged per-chunk inside the loop rather than built once here.
         user_ref_videos = []  # list of (frames_tensor, paired_audio_dict_or_None, entry_dict)
-        for entry in (tdata.get("refVideos") or [])[:3]:
+        for ui_idx, entry in enumerate((tdata.get("refVideos") or [])[:3]):
             if not entry or not entry.get("file"):
+                continue
+            if mode == MODE_HYBRID and not entry.get("shared"):
                 continue
             tensor = _load_ref_video_tensor(entry)
             if tensor is None:
@@ -1202,7 +2077,7 @@ class MuseMinimaxDirector:
             # embedded audio track (PyAV doesn't care whether the container is "video" or
             # "audio", it just reads whichever stream exists) — no separate decode path needed.
             paired_audio = _load_ref_audio_clip(entry) if entry.get("includeAudio") else None
-            user_ref_videos.append((tensor, paired_audio, entry))
+            user_ref_videos.append((tensor, paired_audio, entry, ui_idx))
 
         # list of (AUDIO dict, entry_dict, original_ui_index) — the original index
         # (not the filtered position here) is what Ref Audio N <-> Ref N positional
@@ -1212,9 +2087,20 @@ class MuseMinimaxDirector:
         for ui_idx, entry in enumerate((tdata.get("refAudios") or [])[:3]):
             if not entry or not entry.get("file"):
                 continue
+            if mode == MODE_HYBRID and not entry.get("shared"):
+                continue
             clip_audio = _load_ref_audio_clip(entry)
             if clip_audio is not None:
                 user_ref_audios.append((clip_audio, entry, ui_idx))
+
+        # Exposed as real outputs (ref_audio_1_used/2_used/3_used) so Refine V1.3 can
+        # wire in the exact same voice lock — same reasoning as ref_images_used,
+        # keyed by ui_idx (the original Ref Audio slot number) rather than filtered
+        # position, matching the Ref Audio N <-> Ref N pairing convention.
+        ref_audio_by_idx = {ui_idx: clip_audio for clip_audio, _entry, ui_idx in user_ref_audios}
+        ref_audio_1_used = ref_audio_by_idx.get(0)
+        ref_audio_2_used = ref_audio_by_idx.get(1)
+        ref_audio_3_used = ref_audio_by_idx.get(2)
 
         # Latent-Only Scouting used to only ever keep the LAST chunk's Stage-1 latent
         # (candidate_N_latent silently dropped every earlier chunk) — fine for a
@@ -1229,7 +2115,7 @@ class MuseMinimaxDirector:
         # collides with another run; Refine deletes it once it's done with it. Only
         # created when Latent-Only Scouting is actually on — every other path is
         # unaffected and never touches disk for this.
-        run_scout_dir = tempfile.mkdtemp(prefix="muse_v1_2_scout_") if two_stage_seed_hunt_latent_only else None
+        run_scout_dir = tempfile.mkdtemp(prefix="muse_v1_4_scout_") if two_stage_seed_hunt_latent_only else None
 
         # The entire per-chunk build + sample + decode pipeline below only ever
         # depends on `seed` in one place (RandomNoise's noise_seed) — everything
@@ -1244,9 +2130,54 @@ class MuseMinimaxDirector:
             compiled_prompts = []
             prev_chunk_images = None
             prev_chunk_audio = None
+            prev_lip_sync_final_latent = None
+            prev_lip_sync_grid_overrun = 0
+            # raw_latent_carry_test's own state — ported from the Beta Director,
+            # see that toggle's own tooltip for the full reasoning. Tracked
+            # separately from prev_chunk_images/_audio (which vae_reencode_carry_test
+            # uses): these hold the actual un-decoded sampler latents, matched by
+            # resolution (Stage 1 to Stage 1, final to final) so no cross-resolution
+            # resize is ever needed at the injection point itself.
+            prev_chunk_stage1_context_latent = None
+            prev_chunk_final_context_latent = None
+            if long_form_enabled and render_start_idx > 0:
+                checkpoint = _load_long_form_checkpoint(long_form_project_id)
+                if int(checkpoint.get("completed_chunk") or 0) != render_start_idx:
+                    raise ValueError(
+                        f"Resume checkpoint ends at chunk {checkpoint.get('completed_chunk', 0)}, "
+                        f"so the next render must start at chunk {int(checkpoint.get('completed_chunk') or 0) + 1}."
+                    )
+                saved_meta = checkpoint.get("metadata") or {}
+                if int(saved_meta.get("width", width)) != width or int(saved_meta.get("height", height)) != height:
+                    raise ValueError("Project resolution changed since its checkpoint; restore the saved project settings before resuming.")
+                if int(saved_meta.get("seed", pass_seed)) != int(pass_seed):
+                    raise ValueError("Project seed changed since its checkpoint; restore the saved project settings before resuming.")
+                prev_chunk_images = checkpoint["tail_frames"].float()
+                prev_lip_sync_final_latent = _latent_from_saved_parts(checkpoint["latent_parts"])
+                prev_lip_sync_grid_overrun = int(checkpoint.get("grid_overrun") or 0)
+                log.info("[MuseMinimaxDirector] Resuming long-form project %s at chunk %d from disk checkpoint.", long_form_project_id, render_start_idx + 1)
             last_chunk_stage1_latent = None
+            # Tracked alongside last_chunk_stage1_latent for the exact same reason —
+            # Refine V1.3 needs the raw (unencoded) keyframe pixel images and the
+            # frame count actually used, to rebuild minimax_keyframes conditioning at
+            # its OWN refine resolution the same way this node's own Stage 2 already
+            # does (see _rebuild_keyframe_conditioning_for_stage2) — reusing chunk_first/
+            # chunk_last unchanged would hit the exact same shape-mismatch bug that was
+            # just fixed here. None/None for Reference (Omni) mode, where they're unused.
+            last_chunk_first = None
+            last_chunk_last = None
+            last_chunk_frame_count = None
+            # Which checkpoint (fl2va vs ref2va) actually generated the last chunk —
+            # Refine V1.3 uses this to auto-pick the correct model instead of relying
+            # on the user to remember and manually rewire it per mode. Captured
+            # per-chunk (not computed once from `mode` alone) because Reference mode's
+            # hybrid_continuation can switch a single run's own continuation chunks
+            # onto the fl2va checkpoint mid-run — the last chunk's own real choice is
+            # what matters, not a run-wide assumption.
+            last_chunk_shifted_model = None
 
-            for chunk_idx, chunk_segments in enumerate(buckets):
+            for chunk_idx in range(render_start_idx, render_end_idx + 1):
+                chunk_segments = buckets[chunk_idx]
                 chunk_len_seconds = chunk_lengths[chunk_idx]
                 visible_chunk_length = align_frame_count(max(5, round(chunk_len_seconds * 24)))
                 # A continuation chunk's own first _KEYFRAME_INJECTION_FRAMES frames
@@ -1290,7 +2221,196 @@ class MuseMinimaxDirector:
                 # use it too.
                 saved_chunks_for_pg = tdata.get("chunks") or []
                 this_chunk_data = saved_chunks_for_pg[chunk_idx] if chunk_idx < len(saved_chunks_for_pg) else {}
+                chunk_generation_mode = mode
+                if mode == MODE_HYBRID:
+                    selected_chunk_mode = (this_chunk_data.get("generation_mode") or "Hybrid").strip()
+                    chunk_generation_mode = {
+                        "Reference": MODE_REFERENCE,
+                        "First/Last Frame": MODE_FIRST_LAST,
+                        # Legacy saves briefly exposed Hybrid as a chunk-level
+                        # choice. Hybrid is the overall workflow mode; migrate
+                        # those chunks to its guided First/Last path.
+                        "Hybrid": MODE_FIRST_LAST,
+                    }.get(selected_chunk_mode, MODE_REFERENCE)
+
+                # Stable slot overlay: an active shared asset reserves its exact
+                # Ref/Audio/Video number. The same local slot is ignored; otherwise
+                # that local card occupies the unchanged number. No dense renumbering.
+                chunk_tdata = tdata
+                chunk_user_ref_videos = list(user_ref_videos)
+                # 2026-09-04: "Continue across chunks" — lets one long reference video
+                # (e.g. a 45s dance) drive motion across a whole multi-chunk render,
+                # instead of every chunk reusing the exact same fixed Set In/Out window
+                # (the previous behavior, still what happens when this is off). The
+                # slot's own Set In/Out is treated as the FULL performance's window;
+                # each chunk carves its own slice out of it using chunk_start_sec/
+                # chunk_len_seconds — the same per-chunk timing the CUT/dialogue
+                # segmenting already uses elsewhere, so chunk boundaries here always
+                # agree with chunk boundaries everywhere else in the compiled prompt.
+                # Re-decodes per chunk (through the same _load_ref_video_tensor fixed
+                # tonight — correct real-time-to-24fps resampling, no separate logic
+                # needed here) rather than slicing the one globally-loaded tensor,
+                # since re-seeking the source file is simpler and more correct than
+                # trying to re-derive frame boundaries from an already-resampled batch.
+                if any(entry.get("continueAcrossChunks") for _t, _p, entry, _idx in user_ref_videos):
+                    rebuilt_ref_videos = []
+                    for tensor, paired_audio, entry, ui_idx in user_ref_videos:
+                        if not entry.get("continueAcrossChunks"):
+                            rebuilt_ref_videos.append((tensor, paired_audio, entry, ui_idx))
+                            continue
+                        base_start = float(entry.get("trimStartSec", 0) or 0)
+                        base_end = entry.get("trimEndSec")
+                        slice_start = base_start + chunk_start_sec
+                        slice_end = slice_start + chunk_len_seconds
+                        if base_end is not None:
+                            slice_end = min(slice_end, float(base_end))
+                        if slice_start >= slice_end:
+                            # This chunk falls entirely past the source's own window —
+                            # e.g. the render's total duration is longer than the
+                            # performance actually is. Falls back to the slot's last
+                            # available slice rather than silently sending H3 nothing.
+                            log.warning("[MuseMinimaxDirector] chunk %d starts at %.2fs, past the end of this "
+                                        "video's own Set In/Out window (%.2fs-%s) — reusing its final slice "
+                                        "instead of an empty one.", chunk_idx + 1, chunk_start_sec, base_start, base_end)
+                            rebuilt_ref_videos.append((tensor, paired_audio, entry, ui_idx))
+                            continue
+                        chunk_entry = dict(entry)
+                        chunk_entry["trimStartSec"] = slice_start
+                        chunk_entry["trimEndSec"] = slice_end
+                        chunk_tensor = _load_ref_video_tensor(chunk_entry)
+                        if chunk_tensor is None:
+                            rebuilt_ref_videos.append((tensor, paired_audio, entry, ui_idx))
+                            continue
+                        chunk_paired_audio = _load_ref_audio_clip(chunk_entry) if entry.get("includeAudio") else None
+                        rebuilt_ref_videos.append((chunk_tensor, chunk_paired_audio, chunk_entry, ui_idx))
+                    chunk_user_ref_videos = rebuilt_ref_videos
+                chunk_user_ref_audios = list(user_ref_audios)
+                if mode == MODE_HYBRID:
+                    shared_characters = tdata.get("characters") or []
+                    local_characters = this_chunk_data.get("localCharacters") or []
+                    effective_characters = []
+                    for slot_idx in range(MAX_CHARACTER_SLOTS):
+                        shared_entry = shared_characters[slot_idx] if slot_idx < len(shared_characters) else None
+                        local_entry = local_characters[slot_idx] if slot_idx < len(local_characters) else None
+                        if shared_entry and shared_entry.get("shared") and (shared_entry.get("file") or shared_entry.get("image_b64")):
+                            effective_characters.append(shared_entry)
+                        else:
+                            effective_characters.append(local_entry)
+                    chunk_tdata = dict(tdata)
+                    chunk_tdata["characters"] = effective_characters
+
+                    shared_video_by_slot = {ui_idx: (tensor, paired, meta, ui_idx) for tensor, paired, meta, ui_idx in user_ref_videos}
+                    chunk_user_ref_videos = []
+                    local_videos = this_chunk_data.get("localRefVideos") or []
+                    for slot_idx in range(3):
+                        if slot_idx in shared_video_by_slot:
+                            chunk_user_ref_videos.append(shared_video_by_slot[slot_idx])
+                            continue
+                        entry = local_videos[slot_idx] if slot_idx < len(local_videos) else None
+                        if not entry or not entry.get("file"):
+                            continue
+                        tensor = _load_ref_video_tensor(entry)
+                        if tensor is not None:
+                            paired = _load_ref_audio_clip(entry) if entry.get("includeAudio") else None
+                            chunk_user_ref_videos.append((tensor, paired, entry, slot_idx))
+
+                    shared_audio_by_slot = {ui_idx: (clip_audio, meta, ui_idx) for clip_audio, meta, ui_idx in user_ref_audios}
+                    chunk_user_ref_audios = []
+                    local_audios = this_chunk_data.get("localRefAudios") or []
+                    for slot_idx in range(3):
+                        if slot_idx in shared_audio_by_slot:
+                            chunk_user_ref_audios.append(shared_audio_by_slot[slot_idx])
+                            continue
+                        entry = local_audios[slot_idx] if slot_idx < len(local_audios) else None
+                        if not entry or not entry.get("file"):
+                            continue
+                        clip_audio = _load_ref_audio_clip(entry)
+                        if clip_audio is not None:
+                            chunk_user_ref_audios.append((clip_audio, entry, slot_idx))
+
+                # Lip Sync is timeline audio, not a generic short voice sample. Feed
+                # each H3 call only the matching section of the selected full mix:
+                # chunk 1 gets 0-15s, chunk 2 gets 15-30s, etc. Reusing the complete
+                # 45s file in every call gave each chunk conflicting timing context.
+                # Keep the full selected master separately for the exact H3 song-grid
+                # node; only ordinary ref_audios receives the visible per-chunk slice.
+                full_lip_sync_candidates = [
+                    (clip_audio, meta, ui_idx)
+                    for clip_audio, meta, ui_idx in chunk_user_ref_audios
+                    if (meta.get("retention") or "reference") == "fully_copy"
+                ]
+                chunk_lip_sync_master_audio = (
+                    full_lip_sync_candidates[0][0] if full_lip_sync_candidates else None
+                )
+                sliced_chunk_audios = []
+                for clip_audio, meta, ui_idx in chunk_user_ref_audios:
+                    if (meta.get("retention") or "reference") == "fully_copy" and meta.get("file"):
+                        selected_start = float(meta.get("trimStartSec", 0) or 0)
+                        selected_end_raw = meta.get("trimEndSec")
+                        chunk_audio_start = selected_start + float(chunk_bounds[chunk_idx][0])
+                        chunk_audio_end = selected_start + float(chunk_bounds[chunk_idx][1])
+                        if selected_end_raw is not None:
+                            chunk_audio_end = min(chunk_audio_end, float(selected_end_raw))
+                        per_chunk_audio = _load_ref_audio_clip({
+                            **meta,
+                            "trimStartSec": chunk_audio_start,
+                            "trimEndSec": chunk_audio_end,
+                        })
+                        if per_chunk_audio is not None:
+                            clip_audio = per_chunk_audio
+                    sliced_chunk_audios.append((clip_audio, meta, ui_idx))
+                chunk_user_ref_audios = sliced_chunk_audios
+                # A target video has only one complete final audio track. If a
+                # malformed state contains several fully_copy slots, use the
+                # first stable UI slot as the exact latent-driving track.
+                lip_sync_candidates = [
+                    (clip_audio, meta, ui_idx)
+                    for clip_audio, meta, ui_idx in chunk_user_ref_audios
+                    if (meta.get("retention") or "reference") == "fully_copy"
+                ]
+                chunk_lip_sync_audio = lip_sync_candidates[0][0] if lip_sync_candidates else None
+                chunk_lip_sync_meta = lip_sync_candidates[0][1] if lip_sync_candidates else None
+                if len(lip_sync_candidates) > 1:
+                    log.warning(
+                        "[MuseMinimaxDirector] Chunk %d has %d fully_copy audio slots. "
+                        "Only the first can be the complete final track; locking Ref Audio %d.",
+                        chunk_idx + 1, len(lip_sync_candidates), lip_sync_candidates[0][2] + 1,
+                    )
+                char_ref_images, subject_lines, subject_retention_meta, subject_number_by_char_index = _build_character_subjects(
+                    chunk_tdata, width, height, resize_method)
+                subject_count = len(subject_lines)
+                bg_index = len(char_ref_images)
+                configured_first = first_frame
+                configured_last = last_frame if is_last_chunk else None
+                if mode == MODE_HYBRID:
+                    first_entry = this_chunk_data.get("firstFrameImage") or (
+                        tdata.get("firstFrameImage") if chunk_idx == 0 else {}
+                    ) or {}
+                    last_entry = this_chunk_data.get("lastFrameImage") or (
+                        tdata.get("lastFrameImage") if is_last_chunk else {}
+                    ) or {}
+                    configured_first = _fit_image_to_target(
+                        _load_character_image(first_entry) if first_entry else None,
+                        width, height, resize_method)
+                    configured_last = _fit_image_to_target(
+                        _load_character_image(last_entry) if last_entry else None,
+                        width, height, resize_method)
+
                 style_line = (this_chunk_data.get("style_line") or "").strip()
+                # 2026-09-04: "Analyze First Frame" scene-anchor text — captured from
+                # the actual frame at this video's own Set In point, describing the
+                # existing scene's layout/objects/colors — gets prepended here, ahead
+                # of every CUT, matching MiniMax's own guidance to establish scene
+                # anchors before describing new action. Lives on user_ref_videos (set
+                # once, not per-chunk) same as continueAcrossChunks/overlayOriginalAudio
+                # above, so it's already in scope this early in the per-chunk loop.
+                scene_anchors = [
+                    (entry.get("sceneAnchor") or "").strip()
+                    for _t, _p, entry, _idx in user_ref_videos
+                    if (entry.get("sceneAnchor") or "").strip()
+                ]
+                if scene_anchors:
+                    style_line = (style_line + " " if style_line else "") + " ".join(scene_anchors)
 
                 chunk_ref_videos = None
                 chunk_ref_audios = None
@@ -1333,9 +2453,11 @@ class MuseMinimaxDirector:
                             "or actions beyond what's described, and no dialogue or vocalization unless "
                             "the shot description explicitly includes spoken lines."
                         )
-                elif mode != MODE_REFERENCE:
-                    chunk_first = prev_chunk_images[-1:] if prev_chunk_images is not None else first_frame
-                    chunk_last = last_frame if is_last_chunk else None
+                elif chunk_generation_mode != MODE_REFERENCE:
+                    chunk_first = configured_first if configured_first is not None else (
+                        prev_chunk_images[-1:] if prev_chunk_images is not None else None
+                    )
+                    chunk_last = configured_last
                     if prev_chunk_images is not None:
                         base_continuity_extra = (
                             " Continue the ongoing action naturally from this pose and framing — "
@@ -1344,7 +2466,49 @@ class MuseMinimaxDirector:
                 else:
                     chunk_first = chunk_last = None
 
-                if mode == MODE_REFERENCE and not use_hybrid_chunk:
+                # V1.4 Hybrid storyboard guides use visible time within a chunk. Continuation
+                # chunks contain a protected prefix which is trimmed after decode, so shift the
+                # native frame index by that exact prefix rather than making users account for it.
+                chunk_guides = []
+                if mode == MODE_HYBRID:
+                    carry_prefix = 0
+                    if chunk_idx > 0 and prev_chunk_images is not None:
+                        carry_prefix = (
+                            align_frame_count(min(int(vae_reencode_carry_length), int(prev_chunk_images.shape[0])))
+                            if vae_reencode_carry_test else _KEYFRAME_INJECTION_FRAMES
+                        )
+                    used_guide_frames = set()
+                    for guide_no, entry in enumerate(this_chunk_data.get("localGuides") or [], 1):
+                        if not entry or not (entry.get("file") or entry.get("image_b64")):
+                            continue
+                        try:
+                            entry_chunk = chunk_idx + 1
+                            visible_time = float(entry.get("time", 0.0))
+                        except (TypeError, ValueError):
+                            raise ValueError(f"Hybrid Guide {guide_no} has an invalid chunk or time value.")
+                        if visible_time <= 0.0 or visible_time >= float(chunk_len_seconds):
+                            raise ValueError(
+                                f"Hybrid Guide {guide_no} time must be greater than 0 and less than "
+                                f"Chunk {entry_chunk}'s {chunk_len_seconds:.2f}s visible duration."
+                            )
+                        guide_image = _load_character_image(entry)
+                        if guide_image is None:
+                            raise ValueError(f"Hybrid Guide {guide_no} has no readable image.")
+                        frame_idx = carry_prefix + int(round(visible_time * 24.0))
+                        if frame_idx <= 0 or frame_idx >= chunk_length - 1:
+                            raise ValueError(f"Hybrid Guide {guide_no} resolves outside the usable frame range.")
+                        if frame_idx in used_guide_frames:
+                            raise ValueError(f"Two Hybrid Guides resolve to frame {frame_idx} in Chunk {entry_chunk}.")
+                        used_guide_frames.add(frame_idx)
+                        chunk_guides.append({
+                            "image": guide_image[:1], "frame_idx": frame_idx,
+                            "visible_time": visible_time,
+                            "description": (entry.get("description") or "").strip(),
+                            "guide_number": guide_no,
+                        })
+                    chunk_guides.sort(key=lambda item: item["frame_idx"])
+                chunk_guide_prompt_lines = []
+                if chunk_generation_mode in (MODE_REFERENCE, MODE_HYBRID) and not use_hybrid_chunk:
                     # Non-hybrid Reference (Omni) chunks are the only case that gets
                     # MiniMax's own six-section reference-mode prompt format — hybrid
                     # chunks and First/Last Frame mode route through MiniMaxH3ImageToVideo,
@@ -1383,7 +2547,7 @@ class MuseMinimaxDirector:
                     for seg in chunk_segments:
                         if not (seg.get("prompt") or "").strip():
                             continue
-                        for char_idx in _seg_speaker_indices(seg):
+                        for char_idx in _seg_all_speaker_indices(seg):
                             if char_idx in subject_number_by_char_index:
                                 subj_n = subject_number_by_char_index[char_idx]
                                 if subj_n not in speaker_assign:
@@ -1424,7 +2588,7 @@ class MuseMinimaxDirector:
                         )
                         task_flags.add("video continuation")
                         video_slot += 1
-                    for v, paired_audio, meta in user_ref_videos:
+                    for v, paired_audio, meta, ui_idx in chunk_user_ref_videos:
                         if video_slot > 2:
                             log.warning("[MuseMinimaxDirector] ref_video slots full (3 max, one reserved for chunk "
                                         "carry-over) — dropping an extra user-provided reference video.")
@@ -1444,25 +2608,111 @@ class MuseMinimaxDirector:
                             chunk_subject_lines.append(f"<Subject {subj_n}> is {v_desc} (from `<Video {tag_n}>`).")
                             chunk_retention_lines.append(f"<Subject {subj_n}> (from `<Video {tag_n}>`): {v_retention} - {v_desc}.")
                         else:
-                            chunk_retention_lines.append(
-                                f"`<Video {tag_n}>` (camera/motion reference): {v_retention} - only structural/camera "
-                                "characteristics are retained; no visible content is reused."
-                            )
+                            # CORRECTED 2026-09-04: the single fixed sentence that used to sit
+                            # here ("guides motion, camera movement, and performance timing; no
+                            # visible scene, environment, or on-screen content from this video is
+                            # reused") was applied UNCONDITIONALLY regardless of which retention
+                            # level was actually selected — it only branched on whether a
+                            # description was typed, never on v_retention itself. That's wrong
+                            # for three of the four VIDEO_RETENTION_OPTIONS values: "no visible
+                            # content reused" is only true for weak_reference. For
+                            # partially_preserved ("duplicate video, replace character
+                            # (recommended for editing)" in the UI), the whole point is that the
+                            # video's own scene/environment/action IS reused — only the subject
+                            # is swapped — so telling H3 "no visible content is reused" directly
+                            # contradicted the CUT-level "replace the dancer, keep everything
+                            # else" instruction, and was the confirmed real cause of a render
+                            # ignoring its reference video's motion entirely (2026-09-04). Now
+                            # branches per retention level, matching MiniMax's own confirmed
+                            # working examples (character/clothing/shoe/background replacement —
+                            # all phrased as "completely remove/replace X while preserving Y from
+                            # the video", never as "no visible content reused").
+                            if v_retention == "partially_preserved":
+                                chunk_retention_lines.append(
+                                    f"`<Video {tag_n}>` (editing source): {v_retention} - the original subject "
+                                    f"in `<Video {tag_n}>` is completely removed and replaced by the character "
+                                    "reference(s) provided, while the exact body motion, choreography, timing, "
+                                    f"camera movement, and environment from `<Video {tag_n}>` are preserved."
+                                )
+                            elif v_retention == "fully_preserved":
+                                chunk_retention_lines.append(
+                                    f"`<Video {tag_n}>` (source video): {v_retention} - the video's visible "
+                                    "content, motion, camera movement, and environment are reproduced closely, "
+                                    f"matching `<Video {tag_n}>`."
+                                )
+                            elif v_retention == "attribute_transfer":
+                                chunk_retention_lines.append(
+                                    f"`<Video {tag_n}>` (attribute source): {v_retention} - a specific attribute "
+                                    f"(e.g. clothing, footwear) is transferred from `<Video {tag_n}>` onto the "
+                                    "target subject, while all other visible content, motion, camera movement, "
+                                    f"and timing are preserved from `<Video {tag_n}>`."
+                                )
+                            else:  # weak_reference
+                                chunk_retention_lines.append(
+                                    f"`<Video {tag_n}>` (motion/camera reference): {v_retention} - guides motion, "
+                                    "camera movement, and performance timing; no visible scene, environment, or "
+                                    "on-screen content from this video is reused."
+                                )
                         if paired_audio is not None:
                             chunk_ref_video_audios[f"ref_video_audio_{video_slot}"] = paired_audio
                             audio_tag_counter += 1
                             chunk_audio_subject_lines.append(f"<Audio {audio_tag_counter}> is the audio of `<Video {tag_n}>`.")
-                            chunk_audio_retention_lines.append(
-                                f"<Audio {audio_tag_counter}>: reference - guides voice timbre/delivery without "
-                                "copying the original signal."
-                            )
-                            task_flags.add("audio reference")
+                            # ADDED 2026-09-04: this used to hardcode "reference - guides voice
+                            # timbre/delivery" unconditionally, with no UI control at all — wrong
+                            # on two counts for a reference video's own embedded soundtrack (as
+                            # opposed to a Ref Audio slot, which genuinely is a voice-cloning
+                            # reference): (1) it's usually music/beat/ambience, not a voice, so
+                            # "voice timbre" doesn't apply; (2) there was no way to select
+                            # fully_copy to test whether reusing the real track (e.g. a dance's
+                            # actual beat) gives H3 a real timing anchor instead of inventing its
+                            # own — a real, confirmed-plausible cause of a beat-choreographed
+                            # dance drifting out of sync. New per-video "Audio State" dropdown
+                            # (js, gated on entry.includeAudio, VIDEO_AUDIO_RETENTION_OPTIONS)
+                            # feeds meta["audioRetention"] here; deliberately a SEPARATE field
+                            # from the video's own visual retention (v_retention above) — the two
+                            # are independent questions. Default ("reference" when unset) matches
+                            # the old hardcoded behavior exactly, so any workflow saved before
+                            # this control existed renders identically to before.
+                            av_retention = meta.get("audioRetention") or "reference"
+                            if av_retention == "fully_copy":
+                                chunk_audio_retention_lines.append(
+                                    f"<Audio {audio_tag_counter}>: fully_copy - <Audio {audio_tag_counter}> is "
+                                    "reused 1:1 as the target video's complete final audio track."
+                                )
+                                task_flags.add("audio reuse")
+                            elif av_retention == "partially_copy":
+                                chunk_audio_retention_lines.append(
+                                    f"<Audio {audio_tag_counter}>: partially_copy - selected layers of "
+                                    f"<Audio {audio_tag_counter}> (e.g. rhythm/beat) are carried over into the "
+                                    "target video's final audio."
+                                )
+                                task_flags.add("audio reuse")
+                            elif av_retention == "weak_reference":
+                                chunk_audio_retention_lines.append(
+                                    f"<Audio {audio_tag_counter}>: weak_reference - only broad similarity in "
+                                    f"category or atmosphere from <Audio {audio_tag_counter}> is retained."
+                                )
+                                task_flags.add("audio reference")
+                            else:  # reference (default — matches old hardcoded behavior's retention level)
+                                chunk_audio_retention_lines.append(
+                                    f"<Audio {audio_tag_counter}>: reference - guides tone, rhythm, and delivery "
+                                    "without copying the original signal."
+                                )
+                                task_flags.add("audio reference")
                         video_slot += 1
 
                     chunk_ref_audios = {}
                     audio_slot = 0
                     carry_audio_tag = None
-                    if prev_chunk_audio is not None:
+                    # A fully_copy clip is, by MiniMax's definition, this chunk's
+                    # complete final audio track. Never also feed the previous
+                    # generated tail: that creates two simultaneous audio-reuse
+                    # instructions and can make later chunks abandon the song.
+                    has_fully_copied_audio = any(
+                        (meta.get("retention") or "reference") == "fully_copy"
+                        for _clip_audio, meta, _ui_idx in chunk_user_ref_audios
+                    )
+                    if prev_chunk_audio is not None and not has_fully_copied_audio:
                         # Tail of the previous chunk's own decoded audio, not the whole thing —
                         # H3 treats every ref_audio as a short (2-15s) reference clip.
                         tail_sr = prev_chunk_audio["sample_rate"]
@@ -1478,7 +2728,7 @@ class MuseMinimaxDirector:
                         )
                         task_flags.add("audio reuse")
                         audio_slot += 1
-                    for clip_audio, meta, ui_idx in user_ref_audios:
+                    for clip_audio, meta, ui_idx in chunk_user_ref_audios:
                         if audio_slot > 2:
                             log.warning("[MuseMinimaxDirector] ref_audio slots full (3 max, one reserved for chunk "
                                         "carry-over once a chunk has a predecessor) — dropping an extra reference audio clip.")
@@ -1492,7 +2742,19 @@ class MuseMinimaxDirector:
                         # ("<Audio N> is the voice-timbre reference for <Subject M> (Sx)")
                         # instead of a generic, unlinked description.
                         paired_subj_n = subject_number_by_char_index.get(ui_idx)
-                        if paired_subj_n is not None:
+                        if a_retention == "fully_copy" and paired_subj_n is not None:
+                            sx = speaker_assign.get(paired_subj_n)
+                            sx_suffix = f" (S{sx})" if sx else ""
+                            chunk_audio_subject_lines.append(
+                                f"<Audio {audio_tag_counter}> is the complete source song and exact performance "
+                                f"timeline for <Subject {paired_subj_n}>{sx_suffix}."
+                            )
+                        elif a_retention == "fully_copy":
+                            chunk_audio_subject_lines.append(
+                                f"<Audio {audio_tag_counter}> is the complete source song and exact performance "
+                                "timeline reused as this chunk's final audio track."
+                            )
+                        elif paired_subj_n is not None:
                             sx = speaker_assign.get(paired_subj_n)
                             sx_suffix = f" (S{sx})" if sx else ""
                             chunk_audio_subject_lines.append(
@@ -1501,26 +2763,79 @@ class MuseMinimaxDirector:
                             chunk_audio_subject_lines.append(f"<Audio {audio_tag_counter}> is the voice-timbre reference described as: {a_desc}.")
                         else:
                             chunk_audio_subject_lines.append(f"<Audio {audio_tag_counter}> is a voice-timbre reference.")
-                        chunk_audio_retention_lines.append(
-                            f"<Audio {audio_tag_counter}>: {a_retention} - "
-                            + (a_desc if a_desc else "guides dialogue delivery without copying the original signal.")
-                        )
+                        if a_retention == "fully_copy":
+                            chunk_audio_retention_lines.append(
+                                f"<Audio {audio_tag_counter}>: fully_copy - <Audio {audio_tag_counter}> is reused "
+                                "1:1 as the target video's complete final audio track."
+                            )
+                        elif a_desc:
+                            chunk_audio_retention_lines.append(
+                                f"<Audio {audio_tag_counter}>: {a_retention} - {a_desc}"
+                            )
+                        else:
+                            # CORRECTED 2026-09-04: this used to write the exact same
+                            # "guides dialogue delivery without copying the original
+                            # signal" boilerplate for reference, partially_copy, AND
+                            # weak_reference alike — a direct, confirmed-real
+                            # contradiction for partially_copy specifically, whose own
+                            # official definition is "part of the timeline... IS
+                            # copied," the opposite of "without copying." Same class
+                            # of bug as the video-paired-audio fix earlier tonight,
+                            # just never extended to this standalone Ref Audio path —
+                            # confirmed the actual cause of a real voice-clone accent
+                            # drift on newly-generated dialogue lines using this exact
+                            # setting. Now branches per the official audio-marker
+                            # definitions instead of one sentence for all three.
+                            if a_retention == "partially_copy":
+                                chunk_audio_retention_lines.append(
+                                    f"<Audio {audio_tag_counter}>: partially_copy - select layers of the "
+                                    f"original delivery in <Audio {audio_tag_counter}> (e.g. timbre, rhythm) "
+                                    "are carried over, while the rest of the performance is generated fresh."
+                                )
+                            elif a_retention == "weak_reference":
+                                chunk_audio_retention_lines.append(
+                                    f"<Audio {audio_tag_counter}>: weak_reference - only broad similarity in "
+                                    "category or atmosphere is retained."
+                                )
+                            else:  # reference
+                                chunk_audio_retention_lines.append(
+                                    f"<Audio {audio_tag_counter}>: reference - guides dialogue delivery "
+                                    "without copying the original signal."
+                                )
                         task_flags.add("audio reuse" if a_retention in ("fully_copy", "partially_copy") else "audio reference")
                         audio_slot += 1
 
-                    # Reference images: characters are always present; the fixed background
-                    # slot holds either the real background image (first chunk / no
-                    # predecessor, wrapped as its own <Subject N> the same way characters
-                    # are) or, on continuation chunks, the previous chunk's own last frame
-                    # as a standalone <Picture N> keyframe anchor — per the guide's own
-                    # carve-out, a genuine first/last/keyframe anchor gets a standalone
-                    # Picture entry rather than being wrapped as a Subject.
+                    # Reference images: characters are always present. Two more optional
+                    # slots follow them, INDEPENDENTLY — deliberately not mutually
+                    # exclusive the way this used to work. A genuine last-frame
+                    # continuity anchor (continuation chunks only) and this chunk's own
+                    # Location image (may swap to a different photo per chunk — see
+                    # _resolve_location_for_chunk) can both be present on the very same
+                    # chunk; the anchor no longer silently evicts the Location the moment
+                    # a chunk has a predecessor. Anchor is always assigned first when
+                    # present, then Location, so their <Picture N> numbers stay stable
+                    # and predictable regardless of which one(s) are actually present on
+                    # a given chunk. MAX_CHARACTER_SLOTS is capped at 7 specifically so
+                    # both always fit alongside up to 7 characters in the 9-slot pool.
                     chunk_ref_images = dict(char_ref_images)
+                    next_slot = bg_index
                     shot1_prefix = ""
-                    if prev_chunk_images is not None:
+                    # The VAE-reencoded carry path already supplies the previous
+                    # chunk's real tail as protected joint AV latent content. Do
+                    # not also feed its generated last frame back as a new image
+                    # reference: that makes each continuation chunk learn identity
+                    # from the preceding generation instead of solely from the
+                    # user's original reference images, so facial errors can
+                    # compound across a long render. Keep the legacy Picture-N
+                    # anchor when hard carry is disabled because it is then the
+                    # only visual boundary anchor available to this path.
+                    use_generated_picture_anchor = (
+                        prev_chunk_images is not None and not vae_reencode_carry_test
+                    )
+                    if use_generated_picture_anchor:
                         last_frame_still = prev_chunk_images[-1:]
-                        chunk_ref_images[f"ref_image_{bg_index}"] = last_frame_still
-                        anchor_n = bg_index + 1
+                        chunk_ref_images[f"ref_image_{next_slot}"] = last_frame_still
+                        anchor_n = next_slot + 1
                         chunk_retention_lines.append(
                             f"`<Picture {anchor_n}>` ([Shot 1] first-frame anchor): fully_preserved - the exact "
                             "framing, pose, and camera angle at the end of the previous shot."
@@ -1543,24 +2858,68 @@ class MuseMinimaxDirector:
                             "Subject in the frame — do not render a second copy, duplicate, double-exposure, or "
                             "any other person; the scene contains this one person only, throughout. "
                         )
-                    elif background and (background.get("file") or background.get("image_b64")):
-                        tensor = _load_character_image(background)
-                        if tensor is not None:
-                            tensor = _fit_image_to_target(tensor, width, height, resize_method)
-                            chunk_ref_images[f"ref_image_{bg_index}"] = tensor
-                            bg_picture_n = bg_index + 1
-                            bg_subj_n = len(chunk_subject_tags) + 1
-                            chunk_subject_tags.append(f"<Subject {bg_subj_n}>")
-                            bg_desc = (background.get("description") or "").strip()
-                            if bg_desc:
-                                chunk_subject_lines.append(f"<Subject {bg_subj_n}> is {bg_desc} (from `<Picture {bg_picture_n}>`).")
-                            else:
-                                chunk_subject_lines.append(f"<Subject {bg_subj_n}> is the setting shown in `<Picture {bg_picture_n}>`.")
-                            bg_retention = background.get("retention") or "fully_preserved"
-                            bg_presence = _presence_phrase(bg_subj_n, subject_shot_appearances, total_shots)
-                            chunk_retention_lines.append(
-                                f"<Subject {bg_subj_n}> {bg_presence}: {bg_retention} - matches `<Picture {bg_picture_n}>`.")
+                        next_slot += 1
 
+                    chunk_location = None
+                    if mode == MODE_HYBRID:
+                        chunk_location = next((
+                            entry for entry in (this_chunk_data.get("localLocations") or [])
+                            if entry and (entry.get("file") or entry.get("image_b64"))
+                        ), None)
+                        if chunk_location is None:
+                            chunk_location = next((
+                                entry for entry in locations
+                                if entry and (entry.get("file") or entry.get("image_b64"))
+                            ), None)
+                    else:
+                        chunk_location = _resolve_location_for_chunk(locations, chunk_idx + 1)
+                    if chunk_location:
+                        if next_slot >= 9:
+                            raise ValueError("Reference-image limit exceeded: Ref images, Location, continuity anchor and Hybrid Guides share H3's 9 image slots.")
+                        tensor = _load_character_image(chunk_location)
+                        if tensor is not None:
+                            tensor = _fit_reference_image(tensor, width, height, chunk_location.get("fit", "original"))
+                            chunk_ref_images[f"ref_image_{next_slot}"] = tensor
+                            loc_picture_n = next_slot + 1
+                            loc_subj_n = len(chunk_subject_tags) + 1
+                            chunk_subject_tags.append(f"<Subject {loc_subj_n}>")
+                            loc_desc = (chunk_location.get("description") or "").strip()
+                            if loc_desc:
+                                chunk_subject_lines.append(f"<Subject {loc_subj_n}> is {loc_desc} (from `<Picture {loc_picture_n}>`).")
+                            else:
+                                chunk_subject_lines.append(f"<Subject {loc_subj_n}> is the setting shown in `<Picture {loc_picture_n}>`.")
+                            loc_retention = chunk_location.get("retention") or "fully_preserved"
+                            loc_presence = _presence_phrase(loc_subj_n, subject_shot_appearances, total_shots)
+                            chunk_retention_lines.append(
+                                f"<Subject {loc_subj_n}> {loc_presence}: {loc_retention} - matches `<Picture {loc_picture_n}>`.")
+                            next_slot += 1
+
+                    # Reliability recipe from the guide workflow: every timed guide is
+                    # also supplied as a normal reference and named at that same native
+                    # frame in the prompt. H3 has nine image-reference slots total.
+                    for guide in chunk_guides:
+                        if next_slot >= 9:
+                            raise ValueError(
+                                "Hybrid guide/reference limit exceeded: characters, location, continuity "
+                                "anchor and guide images together must fit within H3's 9 image slots."
+                            )
+                        chunk_ref_images[f"ref_image_{next_slot}"] = guide["image"]
+                        picture_n = next_slot + 1
+                        desc = guide["description"] or "the exact subject, scene, composition and camera framing shown"
+                        chunk_subject_lines.append(
+                            f"<Picture {picture_n}> is Hybrid Guide {guide['guide_number']} for frame "
+                            f"{guide['frame_idx']}: {desc}."
+                        )
+                        chunk_retention_lines.append(
+                            f"<Picture {picture_n}> (timed guide at frame {guide['frame_idx']}): "
+                            f"fully_preserved - match its subject, scene, composition and camera framing."
+                        )
+                        chunk_guide_prompt_lines.append(
+                            f"[Hybrid Guide {guide['guide_number']} — frame {guide['frame_idx']}] At frame "
+                            f"{guide['frame_idx']} (visible {guide['visible_time']:.2f}s), reach "
+                            f"<Picture {picture_n}>: {desc}."
+                        )
+                        next_slot += 1
                     task_bits = ["reference generation"]
                     for t in ("video editing", "video continuation", "keyframe completion", "audio reuse", "audio reference"):
                         if t in task_flags:
@@ -1578,7 +2937,8 @@ class MuseMinimaxDirector:
                         # speaker_assign was already computed in the pre-pass above — reused
                         # here, not rebuilt, so a paired audio's own subject_definitions line
                         # and this CUT's (Sx) tag always agree on the same speaker number.
-                        speaker_idxs = _seg_speaker_indices(seg)
+                        line_speakers = _seg_dialogue_speaker_indices(seg)
+                        speaker_idxs = _seg_all_speaker_indices(seg)
                         tagged_any = False
                         for char_idx in speaker_idxs:
                             subj_n = subject_number_by_char_index.get(char_idx)
@@ -1594,7 +2954,7 @@ class MuseMinimaxDirector:
                         # which one owns dialogue that doesn't mention either tag, so leave
                         # it for the user to tag explicitly (e.g. type <Subject 2> themselves)
                         # rather than risk attributing someone else's line to the wrong voice.
-                        if not tagged_any and len(speaker_idxs) == 1:
+                        if line_speakers is None and not tagged_any and len(speaker_idxs) == 1:
                             subj_n = subject_number_by_char_index.get(speaker_idxs[0])
                             s_n = speaker_assign.get(subj_n) if subj_n is not None else None
                             if s_n:
@@ -1618,12 +2978,21 @@ class MuseMinimaxDirector:
                                     text = f"<Subject {subj_n}> (S{s_n}): {text}"
                                 else:
                                     text = f"<Subject {subj_n}> (S{s_n}) continues: {text}"
-                        text = _wrap_dialogue(text, dialogue_language)
+                        if line_speakers is not None:
+                            speaker_ids = []
+                            for char_idx in line_speakers:
+                                subj_n = subject_number_by_char_index.get(char_idx) if isinstance(char_idx, int) else None
+                                speaker_ids.append(speaker_assign.get(subj_n) if subj_n is not None else None)
+                            text = _wrap_dialogue(text, dialogue_language, speaker_ids)
+                        else:
+                            text = _wrap_dialogue(text, dialogue_language)
                         if shot_idx == 1:
                             shot_lines.append(f"[Shot 1] {shot1_prefix}{text}")
                         else:
                             start_in_chunk = max(0.0, seg.get("_abs_start", 0.0) - chunk_start_sec)
                             shot_lines.append(f"[Shot {shot_idx}] At {_format_timestamp(start_in_chunk)}, {text}")
+
+                    shot_lines.extend(chunk_guide_prompt_lines)
 
                     soundscape_text = (this_chunk_data.get("overall_soundscape") or "").strip()
                     music_text = (this_chunk_data.get("non_diegetic_music") or "").strip()
@@ -1640,13 +3009,30 @@ class MuseMinimaxDirector:
                         style_line, shot_lines, soundscape_text, music_text,
                     )
 
-                if mode != MODE_REFERENCE or use_hybrid_chunk:
+                if chunk_generation_mode == MODE_FIRST_LAST or use_hybrid_chunk:
                     # Per MiniMax's own base-mode (T2VA/I2VA/FL2VA/L2VA) prompt guide —
                     # no <Subject N> layer here, just the two keyframe images (if any)
                     # tagged <Picture N> and a 3-section format, not the six-section
                     # Reference-mode one above.
                     base_shot_lines, base_last_shot = _build_base_mode_shot_lines(
                         chunk_segments, chunk_start_sec, dialogue_language)
+                    if chunk_guides:
+                        # Guide-bearing continuation chunks use the combined Hybrid helper;
+                        # guide-free chunks retain V1.2B's existing FL2V continuation path.
+                        for guide in chunk_guides:
+                            slot = len(chunk_ref_images)
+                            if slot >= 9:
+                                raise ValueError("Hybrid guide images exceed H3's 9 image-reference slots.")
+                            chunk_ref_images[f"ref_image_{slot}"] = guide["image"]
+                            picture_n = slot + 1
+                            desc = guide["description"] or "the exact subject, scene, composition and camera framing shown"
+                            guide_line = (
+                                f"[Hybrid Guide {guide['guide_number']} — frame {guide['frame_idx']}] At frame "
+                                f"{guide['frame_idx']} (visible {guide['visible_time']:.2f}s), reach "
+                                f"<Picture {picture_n}>: {desc}."
+                            )
+                            base_shot_lines.append(guide_line)
+                            chunk_guide_prompt_lines.append(guide_line)
                     keyframe_line = _build_keyframe_alignment_line(
                         chunk_first is not None, chunk_last is not None, base_last_shot, chunk_len_seconds)
                     if keyframe_line:
@@ -1679,17 +3065,53 @@ class MuseMinimaxDirector:
                 # its CUTs. this_chunk_data was already looked up near the top of this
                 # loop iteration (for style_line/soundscape/music).
                 prompt_gen_text = (this_chunk_data.get("prompt_gen_committed_text") or "").strip()
-                if mode == MODE_REFERENCE and not use_hybrid_chunk and this_chunk_data.get("prompt_gen_enabled") and prompt_gen_text:
+                if chunk_generation_mode in (MODE_REFERENCE, MODE_HYBRID) and not use_hybrid_chunk and this_chunk_data.get("prompt_gen_enabled") and prompt_gen_text:
                     chunk_prompt = prompt_gen_text
                 elif use_prompt_override and (prompt_override or "").strip():
-                    chunk_prompt = prompt_override.strip()
+                    chunk_prompt = _select_chunk_from_prompt_override(prompt_override, chunk_idx, num_chunks)
+                # Socket/Prompt-Gen overrides must not erase the guide recipe's exact
+                # frame statements. Add back only lines the override did not preserve.
+                for guide_line in chunk_guide_prompt_lines:
+                    if guide_line not in chunk_prompt:
+                        chunk_prompt += "\n" + guide_line
+                if chunk_lip_sync_audio is not None and chunk_idx > 0:
+                    # Lip Sync continuation calls must not reinterpret a repeated
+                    # style sentence such as "begin with..." as permission to reset
+                    # the shot at the chunk boundary. Keep this inside the detailed
+                    # section and strictly inside fully_copy.
+                    continuation_instruction = (
+                        "CONTINUATION REQUIREMENT: Continue the preceding footage as one "
+                        "uninterrupted take. Preserve the exact boundary pose, expression, "
+                        "framing, camera axis, scale, lighting, environment state and camera "
+                        "motion; do not restart or reinterpret the shot."
+                    )
+                    detail_marker = "detailed_description:\n"
+                    if detail_marker in chunk_prompt:
+                        chunk_prompt = chunk_prompt.replace(
+                            detail_marker,
+                            detail_marker + continuation_instruction + "\n",
+                            1,
+                        )
+                    else:
+                        chunk_prompt += "\n" + continuation_instruction
                 compiled_prompts.append(f"--- Chunk {chunk_idx + 1}/{num_chunks} (~{chunk_len_seconds:.1f}s) ---\n{chunk_prompt}")
 
                 log.info("[MuseMinimaxDirector] chunk %d/%d, seed=%d, length=%d frames, video_carry=%s, audio_carry=%s, hybrid=%s",
                           chunk_idx + 1, num_chunks, pass_seed, chunk_length, prev_chunk_images is not None,
                           prev_chunk_audio is not None, use_hybrid_chunk)
 
-                if use_hybrid_chunk:
+                if use_hybrid_chunk and chunk_guides:
+                    out = _execute_comfy_node(
+                        MiniMaxH3HybridRefAndKeyframe,
+                        clip=clip, vae=vae, audio_vae=audio_vae, prompt=chunk_prompt,
+                        width=width, height=height, length=chunk_length, ref_image_size=ref_image_size,
+                        first_frame=chunk_first, last_frame=chunk_last,
+                        ref_images=chunk_ref_images if chunk_ref_images else None,
+                        guide_frames=chunk_guides,
+                        also_ref_first_frame=False,
+                    )
+                    chunk_shifted_model = shifted_model_fl2va
+                elif use_hybrid_chunk:
                     out = _execute_comfy_node(
                         MiniMaxH3ImageToVideo,
                         clip=clip, vae=vae, prompt=chunk_prompt,
@@ -1697,7 +3119,21 @@ class MuseMinimaxDirector:
                         first_frame=chunk_first, last_frame=chunk_last,
                     )
                     chunk_shifted_model = shifted_model_fl2va
-                elif mode == MODE_REFERENCE:
+                elif chunk_guides:
+                    out = _execute_comfy_node(
+                        MiniMaxH3HybridRefAndKeyframe,
+                        clip=clip, vae=vae, audio_vae=audio_vae, prompt=chunk_prompt,
+                        width=width, height=height, length=chunk_length, ref_image_size=ref_image_size,
+                        first_frame=chunk_first, last_frame=chunk_last,
+                        ref_images=chunk_ref_images if chunk_ref_images else None,
+                        ref_videos=chunk_ref_videos if chunk_ref_videos else None,
+                        ref_video_audios=chunk_ref_video_audios if chunk_ref_video_audios else None,
+                        ref_audios=chunk_ref_audios if chunk_ref_audios else None,
+                        guide_frames=chunk_guides,
+                        also_ref_first_frame=False,
+                    )
+                    chunk_shifted_model = shifted_model_fl2va if shifted_model_fl2va is not None else shifted_model
+                elif chunk_generation_mode == MODE_REFERENCE:
                     out = _execute_comfy_node(
                         MiniMaxH3ReferenceToVideo,
                         clip=clip, vae=vae, audio_vae=audio_vae, prompt=chunk_prompt,
@@ -1746,7 +3182,33 @@ class MuseMinimaxDirector:
                 # frozen region with the true high-res re-encode instead of leaving it as
                 # whatever the naive latent-space upscale + unprotected priming pass left
                 # behind. Both run together for two-stage; only this one for single-pass.
-                if vae_reencode_carry_test and chunk_idx > 0 and prev_chunk_images is not None:
+                raw_carry_stage1_source = (
+                    prev_chunk_stage1_context_latent if two_stage_sampling else prev_chunk_final_context_latent
+                )
+                if (raw_latent_carry_test and chunk_idx > 0 and chunk_lip_sync_audio is None
+                        and raw_carry_stage1_source is not None):
+                    # Ported from the Beta Director's raw_latent_carry_test — see that
+                    # widget's own tooltip for the full reasoning. Copies the previous
+                    # chunk's own raw sampled latent (no VAE decode/re-encode round trip)
+                    # straight into this chunk's opening latent and hard-freezes it via
+                    # MiniMaxH3GeneratedAVMaskedContext. Matched by resolution rather than
+                    # resized: prev_chunk_stage1_context_latent is the previous chunk's own
+                    # Stage-1 (low-res) output, already the same shape this chunk's own
+                    # fresh Stage-1 latent starts at.
+                    latent, carry_trim_frames = _unpack_node_result(_execute_comfy_node(
+                        MiniMaxH3GeneratedAVMaskedContext,
+                        latent=latent, source_latent={"samples": raw_carry_stage1_source["samples"]},
+                        context_length=int(vae_reencode_carry_length), audio_feather_ticks=8,
+                    ))[:2]
+                    chunk_carry_trim_frames = int(carry_trim_frames)
+                    log.info(
+                        "[MuseMinimaxDirector] chunk %d %s raw-latent carry: requested %d frames, "
+                        "delivered-head trim=%d", chunk_idx + 1,
+                        "Stage 1" if two_stage_sampling else "single-stage",
+                        int(vae_reencode_carry_length), chunk_carry_trim_frames,
+                    )
+                elif (vae_reencode_carry_test and chunk_idx > 0 and prev_chunk_images is not None
+                        and chunk_lip_sync_audio is None):
                     carry_n = align_frame_count(min(int(vae_reencode_carry_length), int(prev_chunk_images.shape[0])))
                     tail_pixels = prev_chunk_images[-carry_n:]
                     # prev_chunk_images is decoded from whatever resolution the previous
@@ -1766,25 +3228,86 @@ class MuseMinimaxDirector:
                     tail_video_latent = _unpack_node_result(_execute_comfy_node(
                         VAEEncode, pixels=tail_pixels, vae=vae,
                     ))[0]
-                    source_latent = {"samples": tail_video_latent["samples"]}
-                    if prev_chunk_audio is not None and prev_chunk_audio["waveform"].shape[-1] > 0:
-                        carry_sr = prev_chunk_audio["sample_rate"]
-                        carry_samples = min(
-                            int(round(carry_n / 24.0 * carry_sr)), prev_chunk_audio["waveform"].shape[-1],
-                        )
-                        tail_waveform = prev_chunk_audio["waveform"][..., -carry_samples:]
-                        tail_audio_latent = _unpack_node_result(_execute_comfy_node(
-                            VAEEncodeAudio, audio={"waveform": tail_waveform, "sample_rate": carry_sr}, vae=audio_vae,
-                        ))[0]
-                        source_latent = {"samples": (tail_video_latent["samples"], tail_audio_latent["samples"])}
-                    latent, carry_trim_frames = _unpack_node_result(_execute_comfy_node(
-                        MiniMaxH3GeneratedAVMaskedContext,
-                        latent=latent, source_latent=source_latent,
-                        context_length=carry_n, audio_feather_ticks=8,
-                    ))[:2]
+                    if vae_reencode_carry_video_only_test:
+                        # DIAGNOSTIC test path — see _video_only_carry_inject's own
+                        # docstring. Audio genuinely never touched: no VAEEncodeAudio
+                        # call at all here, unlike the real path below.
+                        latent, carry_trim_frames = _video_only_carry_inject(
+                            latent, tail_video_latent["samples"], carry_n)
+                    else:
+                        source_latent = {"samples": tail_video_latent["samples"]}
+                        if prev_chunk_audio is not None and prev_chunk_audio["waveform"].shape[-1] > 0:
+                            carry_sr = prev_chunk_audio["sample_rate"]
+                            carry_samples = min(
+                                int(round(carry_n / 24.0 * carry_sr)), prev_chunk_audio["waveform"].shape[-1],
+                            )
+                            tail_waveform = prev_chunk_audio["waveform"][..., -carry_samples:]
+                            tail_audio_latent = _unpack_node_result(_execute_comfy_node(
+                                VAEEncodeAudio, audio={"waveform": tail_waveform, "sample_rate": carry_sr}, vae=audio_vae,
+                            ))[0]
+                            source_latent = {"samples": (tail_video_latent["samples"], tail_audio_latent["samples"])}
+                        latent, carry_trim_frames = _unpack_node_result(_execute_comfy_node(
+                            MiniMaxH3GeneratedAVMaskedContext,
+                            latent=latent, source_latent=source_latent,
+                            context_length=carry_n, audio_feather_ticks=8,
+                        ))[:2]
                     chunk_carry_trim_frames = int(carry_trim_frames)
-                    log.info("[MuseMinimaxDirector] chunk %d vae_reencode_carry: %d px re-encoded tail, "
-                             "trim=%d frames", chunk_idx + 1, carry_n, chunk_carry_trim_frames)
+                    log.info("[MuseMinimaxDirector] chunk %d vae_reencode_carry%s: %d px re-encoded tail, "
+                             "trim=%d frames", chunk_idx + 1,
+                             " (VIDEO-ONLY TEST)" if vae_reencode_carry_video_only_test else "",
+                             carry_n, chunk_carry_trim_frames)
+
+                # Lip Sync-only path: use the installed Motion Context repository's
+                # tested master-song node. It derives absolute sample boundaries,
+                # fills H3's exact 40 Hz target audio grid, masks the complete audio
+                # stream, and independently protects the previous visual prefix.
+                # Every non-fully_copy mode bypasses this block unchanged.
+                chunk_lip_sync_exact_audio = None
+                if chunk_lip_sync_audio is not None:
+                    if MiniMaxH3SongMaskedAVContext is None:
+                        raise RuntimeError(
+                            "Lip Sync requires 'H3 Song Audio + Masked Video Context' "
+                            "(ComfyUI-H3-Motion-Context-MultiRef), but it is not registered. "
+                            "Install/enable it and restart ComfyUI."
+                        )
+                    requested_context = (
+                        int(vae_reencode_carry_length)
+                        if chunk_idx > 0 and prev_chunk_images is not None else 0
+                    )
+                    visible_overlap = max(
+                        0, requested_context - int(prev_lip_sync_grid_overrun),
+                    )
+                    raw_clip_start = max(
+                        0.0,
+                        float(chunk_start_sec) - visible_overlap / 24.0,
+                    )
+                    song_kwargs = {}
+                    if requested_context > 0:
+                        # Lip Sync identity refresh: every chunk starts from fresh
+                        # reference conditioning. Carry only the short decoded boundary
+                        # tail, freshly VAE-encoded by the context node; never recycle the
+                        # previous complete generated latent as the new visual foundation.
+                        song_kwargs["vae"] = vae
+                        song_kwargs["source_frames"] = prev_chunk_images
+                    song_out = _unpack_node_result(_execute_comfy_node(
+                        MiniMaxH3SongMaskedAVContext,
+                        latent=latent,
+                        audio_vae=audio_vae,
+                        master_audio=chunk_lip_sync_master_audio,
+                        clip_start_seconds=raw_clip_start,
+                        context_length=requested_context,
+                        source_fps=24.0,
+                        crop="disabled",
+                        **song_kwargs,
+                    ))
+                    latent = song_out[0]
+                    chunk_carry_trim_frames = int(song_out[1])
+                    chunk_lip_sync_exact_audio = chunk_lip_sync_audio
+                    log.info(
+                        "[MuseMinimaxDirector] Chunk %d Lip Sync master-song masked context ACTIVE "
+                        "(raw start %.3fs, protected=%d, visible overlap=%d frames).",
+                        chunk_idx + 1, raw_clip_start, chunk_carry_trim_frames, visible_overlap,
+                    )
 
                 # Same seed for every chunk in a pass (not pass_seed + chunk_idx) — chunks
                 # already differ by prompt text, anchor image, and length, so a per-chunk
@@ -1802,6 +3325,7 @@ class MuseMinimaxDirector:
 
                 if not two_stage_sampling:
                     chunk_stage1_latent = None
+                    chunk_stage1_raw_context_latent = None
                     noise = _unpack_node_result(_execute_comfy_node(RandomNoise, noise_seed=pass_seed))[0]
                     sampled = _unpack_node_result(_execute_comfy_node(
                         SamplerCustomAdvanced, noise=noise, guider=guider, sampler=sampler,
@@ -1826,6 +3350,11 @@ class MuseMinimaxDirector:
                         SamplerCustomAdvanced, noise=noise1, guider=guider, sampler=sampler,
                         sigmas=high_sigmas, latent_image=latent,
                     ))[:2]
+                    # raw_latent_carry_test's own Stage-1 context — captured unconditionally
+                    # here (unlike chunk_stage1_latent below, which only exists in Seed Hunt
+                    # latent-only mode) since a normal two-stage run needs this every chunk,
+                    # not just while scouting.
+                    chunk_stage1_raw_context_latent = dict(pass1_denoised)
 
                     if two_stage_seed_hunt_latent_only:
                         # Scouting mode: skip Stage 2 entirely. pass1_denoised is a real,
@@ -1852,6 +3381,11 @@ class MuseMinimaxDirector:
                         ))[1]
                         chunk_stage1_latent = dict(pass1_denoised)
                         chunk_stage1_latent["_muse_two_stage_raw_audio"] = audio_carry_raw
+                        # Carry the chosen candidate's actual Stage-1 sampling facts with its latent.
+                        # Refine can then reproduce the correct remaining schedule/noise without
+                        # asking the user to calculate Seed Hunt offsets or repeat the split.
+                        chunk_stage1_latent["_muse_seed_used"] = int(pass_seed)
+                        chunk_stage1_latent["_muse_first_pass_steps_used"] = int(split_step)
                     else:
                         chunk_stage1_latent = None
 
@@ -1865,27 +3399,68 @@ class MuseMinimaxDirector:
 
                         video_samples = video_for_upscale["samples"]
                         cur_h_latent, cur_w_latent = video_samples.shape[-2], video_samples.shape[-1]
-                        tgt_h, tgt_w, eff_x, eff_y = _two_stage_snap_upscale_target(
-                            cur_h_latent, cur_w_latent, float(two_stage_upscale_factor)
-                        )
-                        upscaled_samples = comfy.utils.common_upscale(
-                            video_samples, tgt_w, tgt_h, two_stage_upscale_method, "disabled",
-                        )
+                        upscaled_result = _unpack_node_result(_execute_comfy_node(
+                            MinimaxH3LatentUpscaler3D,
+                            latent={"samples": video_samples},
+                            model_name=two_stage_latent_upscale_model,
+                            mode={"mode": "megapixels", "megapixels": float(two_stage_target_megapixels)},
+                            align=CANVAS_MULTIPLE,
+                            enable_temporal_chunking=bool(two_stage_enable_temporal_chunking),
+                            force_unload=True,
+                            device="cuda",
+                            precision="fp16",
+                        ))[0]
+                        upscaled_samples = upscaled_result["samples"]
+                        tgt_h, tgt_w = upscaled_samples.shape[-2], upscaled_samples.shape[-1]
+                        eff_x = tgt_w / cur_w_latent if cur_w_latent else 0.0
+                        eff_y = tgt_h / cur_h_latent if cur_h_latent else 0.0
                         upscaled_video = dict(video_for_upscale)
                         upscaled_video["samples"] = upscaled_samples
                         upscaled_video["noise_mask"] = torch.ones_like(upscaled_samples)
                         log.info(
-                            "[MuseMinimaxDirectorV1_2] chunk %d two-stage upscale: "
-                            "latent %dx%d -> %dx%d (requested %.2fx, effective %.3fx/%.3fx)",
+                            "[MuseMinimaxDirectorV1_4] chunk %d two-stage upscale "
+                            "(MinimaxH3LatentUpscaler3D): latent %dx%d -> %dx%d "
+                            "(requested %.2f MP, effective %.3fx/%.3fx)",
                             chunk_idx + 1, cur_w_latent, cur_h_latent, tgt_w, tgt_h,
-                            float(two_stage_upscale_factor), eff_x, eff_y,
+                            float(two_stage_target_megapixels), eff_x, eff_y,
                         )
+
+                        # First/Last-Frame and Hybrid mode's keyframe conditioning must be
+                        # rebuilt at this new resolution before either remaining pass uses
+                        # it — see _rebuild_keyframe_conditioning_for_stage2's own
+                        # docstring for the full story.
+                        positive_stage2 = positive
+                        stage2_guider = guider
+                        if chunk_first is not None or chunk_last is not None or chunk_guides:
+                            positive_stage2 = _rebuild_keyframe_conditioning_for_stage2(
+                                positive_stage2, vae, chunk_first, chunk_last,
+                                tgt_w, tgt_h, chunk_length, chunk_guides,
+                            )
+                            log.info(
+                                "[MuseMinimaxDirectorV1_2] chunk %d: rebuilt First/Last-Frame "
+                                "keyframe conditioning at the upscaled resolution for Stage 2.",
+                                chunk_idx + 1,
+                            )
+                        # minimax_refs (reference images) get the same Stage-2 resolution
+                        # treatment — see _rebuild_refs_conditioning_for_stage2's own
+                        # docstring for why this matters and why video refs are exempt.
+                        # Applies to Reference-mode chunks too (they never have a
+                        # chunk_first/chunk_last, but they do have refs), so this call is
+                        # unconditional — it's a safe no-op when there's nothing to rebuild.
+                        positive_stage2 = _rebuild_refs_conditioning_for_stage2(
+                            positive_stage2, vae, tgt_w, tgt_h, ref_image_size,
+                            chunk_ref_images, chunk_ref_videos,
+                        )
+                        if positive_stage2 is not positive:
+                            stage2_guider = _unpack_node_result(_execute_comfy_node(
+                                BasicGuider, model=chunk_shifted_model, conditioning=positive_stage2,
+                            ))[0]
 
                         tiny_sigmas = _unpack_node_result(_execute_comfy_node(
                             SplitSigmas, sigmas=low_sigmas, step=0,
                         ))[0]
                         video_primed = _unpack_node_result(_execute_comfy_node(
-                            SamplerCustomAdvanced, noise=noise1, guider=guider, sampler=sampler,
+                            SamplerCustomAdvanced, noise=noise1, guider=stage2_guider, sampler=sampler,
                             sigmas=tiny_sigmas, latent_image=upscaled_video,
                         ))[0]
 
@@ -1923,56 +3498,156 @@ class MuseMinimaxDirector:
                         # high-res VAE re-encode right before the pass that matters most. No
                         # resize is needed to get here: prev_chunk_images was decoded from
                         # the PREVIOUS chunk's own two-stage upscale, which used this same
-                        # width/height/two_stage_upscale_factor (fixed for the whole run),
+                        # width/height/Stage-2 target geometry (fixed for the whole run),
                         # so its final resolution already matches this chunk's tgt_h/tgt_w
                         # by construction — the same reasoning the Combo/TwoStage node's own
                         # Test 17 relies on. Only the future (unprotected) region actually
                         # denoises against low_sigmas below; the copied prefix rides through
                         # unchanged.
-                        if vae_reencode_carry_test and chunk_idx > 0 and prev_chunk_images is not None:
+                        if (raw_latent_carry_test and chunk_idx > 0 and chunk_lip_sync_audio is None
+                                and prev_chunk_final_context_latent is not None):
+                            # Ported from the Beta Director's raw_latent_carry_test — same
+                            # mechanism as the Stage-1 injection above, against the true
+                            # final-resolution previous-chunk latent this time (Stage 2's
+                            # own target, post-upscale). No new guider needed —
+                            # positive_stage2/stage2_guider are untouched, only the latent.
+                            recombined, carry_trim_frames = _unpack_node_result(_execute_comfy_node(
+                                MiniMaxH3GeneratedAVMaskedContext,
+                                latent=recombined,
+                                source_latent={"samples": prev_chunk_final_context_latent["samples"]},
+                                context_length=int(vae_reencode_carry_length), audio_feather_ticks=8,
+                            ))[:2]
+                            chunk_carry_trim_frames = int(carry_trim_frames)
+                            log.info(
+                                "[MuseMinimaxDirector] chunk %d Stage 2 raw-latent carry: requested "
+                                "%d frames, delivered-head trim=%d", chunk_idx + 1,
+                                int(vae_reencode_carry_length), chunk_carry_trim_frames,
+                            )
+                        elif (vae_reencode_carry_test and chunk_idx > 0 and prev_chunk_images is not None
+                                and chunk_lip_sync_audio is None):
                             carry_n = align_frame_count(min(int(vae_reencode_carry_length), int(prev_chunk_images.shape[0])))
                             tail_pixels = prev_chunk_images[-carry_n:]
                             tail_video_latent = _unpack_node_result(_execute_comfy_node(
                                 VAEEncode, pixels=tail_pixels, vae=vae,
                             ))[0]
-                            source_latent = {"samples": tail_video_latent["samples"]}
-                            if prev_chunk_audio is not None and prev_chunk_audio["waveform"].shape[-1] > 0:
-                                carry_sr = prev_chunk_audio["sample_rate"]
-                                carry_samples = min(
-                                    int(round(carry_n / 24.0 * carry_sr)), prev_chunk_audio["waveform"].shape[-1],
-                                )
-                                tail_waveform = prev_chunk_audio["waveform"][..., -carry_samples:]
-                                tail_audio_latent = _unpack_node_result(_execute_comfy_node(
-                                    VAEEncodeAudio, audio={"waveform": tail_waveform, "sample_rate": carry_sr}, vae=audio_vae,
-                                ))[0]
-                                source_latent = {"samples": (tail_video_latent["samples"], tail_audio_latent["samples"])}
-                            recombined, carry_trim_frames = _unpack_node_result(_execute_comfy_node(
-                                MiniMaxH3GeneratedAVMaskedContext,
-                                latent=recombined, source_latent=source_latent,
-                                context_length=carry_n, audio_feather_ticks=8,
-                            ))[:2]
+                            if vae_reencode_carry_video_only_test:
+                                # DIAGNOSTIC test path — see _video_only_carry_inject's
+                                # own docstring. Audio genuinely never touched here either.
+                                recombined, carry_trim_frames = _video_only_carry_inject(
+                                    recombined, tail_video_latent["samples"], carry_n)
+                            else:
+                                source_latent = {"samples": tail_video_latent["samples"]}
+                                if prev_chunk_audio is not None and prev_chunk_audio["waveform"].shape[-1] > 0:
+                                    carry_sr = prev_chunk_audio["sample_rate"]
+                                    carry_samples = min(
+                                        int(round(carry_n / 24.0 * carry_sr)), prev_chunk_audio["waveform"].shape[-1],
+                                    )
+                                    tail_waveform = prev_chunk_audio["waveform"][..., -carry_samples:]
+                                    tail_audio_latent = _unpack_node_result(_execute_comfy_node(
+                                        VAEEncodeAudio, audio={"waveform": tail_waveform, "sample_rate": carry_sr}, vae=audio_vae,
+                                    ))[0]
+                                    source_latent = {"samples": (tail_video_latent["samples"], tail_audio_latent["samples"])}
+                                recombined, carry_trim_frames = _unpack_node_result(_execute_comfy_node(
+                                    MiniMaxH3GeneratedAVMaskedContext,
+                                    latent=recombined, source_latent=source_latent,
+                                    context_length=carry_n, audio_feather_ticks=8,
+                                ))[:2]
                             chunk_carry_trim_frames = int(carry_trim_frames)
-                            log.info("[MuseMinimaxDirector] chunk %d vae_reencode_carry (two-stage): %d px "
-                                     "re-encoded tail, trim=%d frames", chunk_idx + 1, carry_n, chunk_carry_trim_frames)
+                            log.info("[MuseMinimaxDirector] chunk %d vae_reencode_carry (two-stage)%s: %d px "
+                                     "re-encoded tail, trim=%d frames", chunk_idx + 1,
+                                     " (VIDEO-ONLY TEST)" if vae_reencode_carry_video_only_test else "",
+                                     carry_n, chunk_carry_trim_frames)
+
+                        # Lip Sync-only Stage 2: target and previous final latent now
+                        # share the same upscaled spatial geometry, so use the
+                        # repository's preferred direct-latent continuation path.
+                        # This avoids the second decode/re-encode that produced a
+                        # full camera/background reset in the measured test.
+                        if chunk_lip_sync_audio is not None:
+                            requested_context = (
+                                int(vae_reencode_carry_length)
+                                if chunk_idx > 0 and prev_chunk_images is not None else 0
+                            )
+                            visible_overlap = max(
+                                0, requested_context - int(prev_lip_sync_grid_overrun),
+                            )
+                            raw_clip_start = max(
+                                0.0,
+                                float(chunk_start_sec) - visible_overlap / 24.0,
+                            )
+                            song_kwargs = {}
+                            if requested_context > 0:
+                                # Same identity-refresh rule at Stage 2: preserve only
+                                # the real decoded seam tail, not the whole prior latent.
+                                song_kwargs["vae"] = vae
+                                song_kwargs["source_frames"] = prev_chunk_images
+                            song_out = _unpack_node_result(_execute_comfy_node(
+                                MiniMaxH3SongMaskedAVContext,
+                                latent=recombined,
+                                audio_vae=audio_vae,
+                                master_audio=chunk_lip_sync_master_audio,
+                                clip_start_seconds=raw_clip_start,
+                                context_length=requested_context,
+                                source_fps=24.0,
+                                crop="disabled",
+                                **song_kwargs,
+                            ))
+                            recombined = song_out[0]
+                            chunk_carry_trim_frames = int(song_out[1])
+                            chunk_lip_sync_exact_audio = chunk_lip_sync_audio
+                            log.info(
+                                "[MuseMinimaxDirector] Chunk %d Lip Sync Stage-2 direct latent "
+                                "context ACTIVE (raw start %.3fs, protected=%d, visible overlap=%d, direct=%s).",
+                                chunk_idx + 1, raw_clip_start, chunk_carry_trim_frames,
+                                visible_overlap,
+                                False,
+                            )
 
                         noise2 = _unpack_node_result(_execute_comfy_node(DisableNoise))[0]
                         sampled = _unpack_node_result(_execute_comfy_node(
-                            SamplerCustomAdvanced, noise=noise2, guider=guider, sampler=sampler,
+                            SamplerCustomAdvanced, noise=noise2, guider=stage2_guider, sampler=sampler,
                             sigmas=low_sigmas, latent_image=recombined,
                         ))[0]
 
                 if chunk_stage1_latent is not None:
                     last_chunk_stage1_latent = chunk_stage1_latent
+                    last_chunk_first = chunk_first
+                    last_chunk_last = chunk_last
+                    last_chunk_frame_count = chunk_length
+                    last_chunk_shifted_model = chunk_shifted_model
                     if run_scout_dir is not None:
                         candidate_dir = os.path.join(run_scout_dir, f"candidate_{candidate_idx}")
                         os.makedirs(candidate_dir, exist_ok=True)
                         torch.save(
-                            {"latent": chunk_stage1_latent, "prompt": chunk_prompt},
+                            {
+                                "latent": chunk_stage1_latent, "prompt": chunk_prompt,
+                                # first_frame/last_frame/frame_count: None/None/int for
+                                # Reference (Omni) mode, real pixel tensors + int for
+                                # First/Last Frame and Hybrid — Refine V1.3 reads these
+                                # back to rebuild keyframe conditioning at its own
+                                # refine resolution, same reasoning as above.
+                                "first_frame": chunk_first, "last_frame": chunk_last,
+                                "frame_count": chunk_length,
+                                "guide_frames": chunk_guides,
+                                "ref_images": chunk_ref_images,
+                            },
                             os.path.join(candidate_dir, f"chunk_{chunk_idx + 1:04d}.pt"),
                         )
 
                 chunk_images = _unpack_node_result(_execute_comfy_node(VAEDecode, samples=sampled, vae=vae))[0]
-                chunk_audio = _unpack_node_result(_execute_comfy_node(VAEDecodeAudio, samples=sampled, vae=audio_vae))[0]
+                if chunk_lip_sync_exact_audio is not None:
+                    # The lock's exact AUDIO output is the only surviving waveform.
+                    # H3's audio latent is deliberately never decoded in Lip Sync.
+                    chunk_audio = chunk_lip_sync_exact_audio
+                else:
+                    chunk_audio = _unpack_node_result(_execute_comfy_node(
+                        VAEDecodeAudio, samples=sampled, vae=audio_vae,
+                    ))[0]
+                if chunk_lip_sync_exact_audio is not None:
+                    # Preserve the final Stage-2 AV latent for the next Lip Sync
+                    # chunk's direct high-resolution continuation, offloaded to CPU
+                    # before the normal per-chunk cleanup frees GPU tensors.
+                    prev_lip_sync_final_latent = _copy_av_latent_to_cpu(sampled)
 
                 # Every continuation chunk (chunk_idx > 0) is keyframe-anchored to start
                 # from the immediately preceding chunk's own last frame (see the
@@ -1990,6 +3665,43 @@ class MuseMinimaxDirector:
                     # fixed constant otherwise.
                     trim_amount = chunk_carry_trim_frames if chunk_carry_trim_frames is not None else _KEYFRAME_INJECTION_FRAMES
                     trim_n = min(trim_amount, chunk_images.shape[0] - 1)
+                    if chunk_lip_sync_exact_audio is not None:
+                        # The previous raw H3 latent can extend beyond the portion
+                        # delivered on the master-song timeline. Those carried
+                        # overrun frames are NEW future content, not duplicates.
+                        # Remove/blend only the prefix that was actually displayed.
+                        trim_n = max(
+                            0, trim_n - int(prev_lip_sync_grid_overrun),
+                        )
+                    if chunk_lip_sync_exact_audio is not None and all_images and trim_n > 0:
+                        # Repository-style overlap assembly, Lip Sync only. The
+                        # current prefix and previous tail represent the same moments.
+                        # Blend those matching reconstructions in place, replacing
+                        # (not adding) the previous tail so total duration is unchanged.
+                        overlap_n = min(
+                            trim_n,
+                            int(all_images[-1].shape[0]),
+                            int(chunk_images.shape[0]),
+                        )
+                        if overlap_n > 0:
+                            previous_visible = all_images[-1]
+                            current_overlap = chunk_images[:overlap_n].to(
+                                device=previous_visible.device,
+                                dtype=previous_visible.dtype,
+                            )
+                            alpha = torch.linspace(
+                                0.0, 1.0, overlap_n + 2,
+                                device=previous_visible.device,
+                                dtype=previous_visible.dtype,
+                            )[1:-1].view(-1, 1, 1, 1)
+                            blended_overlap = (
+                                previous_visible[-overlap_n:] * (1.0 - alpha)
+                                + current_overlap * alpha
+                            )
+                            all_images[-1] = torch.cat(
+                                [previous_visible[:-overlap_n], blended_overlap],
+                                dim=0,
+                            )
                     new_frames = chunk_images[trim_n:]
                 else:
                     new_frames = chunk_images
@@ -2022,7 +3734,10 @@ class MuseMinimaxDirector:
                 # inserting keeps video length fixed, so audio only ever needs the exact
                 # same _KEYFRAME_INJECTION_FRAMES trim already applied above — no further
                 # length-changing math needed at all, and the two can never drift.
-                n_interp = int(seam_interpolation_frames) if seam_interpolation_frames else 0
+                n_interp = (
+                    0 if chunk_lip_sync_exact_audio is not None
+                    else (int(seam_interpolation_frames) if seam_interpolation_frames else 0)
+                )
                 mid_frame_count = 0
                 if chunk_idx > 0 and n_interp > 0 and new_frames.shape[0] > 1 and prev_chunk_images is not None:
                     if RIFE_VFI is None:
@@ -2048,9 +3763,32 @@ class MuseMinimaxDirector:
                             new_frames = torch.cat(
                                 [mid_frames.to(device=new_frames.device, dtype=new_frames.dtype),
                                  new_frames[mid_frame_count:]], dim=0)
+                if chunk_lip_sync_exact_audio is not None:
+                    # Lip Sync alone uses the source track as master clock. H3's
+                    # 17k+5 frame grid deliberately generates a few disposable
+                    # frames beyond a nominal chunk; crop those video frames rather
+                    # than padding/stretching/changing the exact song to fit them.
+                    exact_samples = chunk_lip_sync_exact_audio["waveform"].shape[-1]
+                    exact_sr = int(chunk_lip_sync_exact_audio["sample_rate"])
+                    target_visible_frames = max(
+                        1, int(round(exact_samples / float(exact_sr) * 24.0)),
+                    )
+                    current_lip_sync_grid_overrun = max(
+                        0, int(new_frames.shape[0]) - target_visible_frames,
+                    )
+                    if new_frames.shape[0] > target_visible_frames:
+                        new_frames = new_frames[:target_visible_frames]
+                    elif new_frames.shape[0] < target_visible_frames:
+                        log.warning(
+                            "[MuseMinimaxDirector] Chunk %d Lip Sync produced only %d visible "
+                            "frames for a %d-frame source-audio window; audio remains untouched.",
+                            chunk_idx + 1, new_frames.shape[0], target_visible_frames,
+                        )
+                    chunk_audio = chunk_lip_sync_exact_audio
+                    prev_lip_sync_grid_overrun = current_lip_sync_grid_overrun
                 all_images.append(new_frames)
                 waveform = chunk_audio["waveform"]
-                if trim_n > 0:
+                if trim_n > 0 and chunk_lip_sync_exact_audio is None:
                     # Audio must lose the same duration as the _KEYFRAME_INJECTION_FRAMES
                     # trim applied to chunk_images above — otherwise this chunk's audio
                     # keeps ~trim_n frames' worth of dialogue/sound with no matching video
@@ -2064,7 +3802,7 @@ class MuseMinimaxDirector:
                 if all_waveform is None:
                     all_waveform = waveform
                     audio_sample_rate = chunk_audio["sample_rate"]
-                elif mid_frame_count > 0:
+                elif mid_frame_count > 0 and chunk_lip_sync_exact_audio is None:
                     # Smooth the seam by ducking (volume-fading) in place — never by
                     # trimming or inserting samples. Both of those change total sample
                     # count, which is exactly what broke sync above; ducking doesn't, so
@@ -2085,6 +3823,28 @@ class MuseMinimaxDirector:
 
                 prev_chunk_images = chunk_images
                 prev_chunk_audio = chunk_audio
+                # raw_latent_carry_test's own state — see its initialization comment
+                # above for why these are tracked separately from prev_chunk_images.
+                if two_stage_sampling and chunk_stage1_raw_context_latent is not None:
+                    prev_chunk_stage1_context_latent = chunk_stage1_raw_context_latent
+                if not two_stage_seed_hunt_latent_only:
+                    prev_chunk_final_context_latent = sampled
+                if long_form_enabled and chunk_lip_sync_exact_audio is not None:
+                    tail_count = min(int(vae_reencode_carry_length), int(prev_chunk_images.shape[0]))
+                    checkpoint_meta = {
+                        "width": int(width), "height": int(height), "fps": 24,
+                        "seed": int(pass_seed), "sampler": str(sampler_name),
+                        "scheduler": str(scheduler), "steps": int(steps),
+                        "total_duration": float(duration_seconds),
+                        "chunk_size": float(chunk_duration_seconds),
+                        "total_chunks": int(num_chunks),
+                    }
+                    _save_long_form_progress(
+                        long_form_project_id, chunk_idx + 1, prev_lip_sync_final_latent,
+                        prev_chunk_images[-tail_count:], prev_lip_sync_grid_overrun,
+                        new_frames, chunk_audio, checkpoint_meta,
+                    )
+                    log.info("[MuseMinimaxDirector] Saved chunk %d/%d and replaced the continuation checkpoint.", chunk_idx + 1, num_chunks)
 
                 # Ported from the Combo/TwoStage node's own per-chunk cleanup — this
                 # node never had it, and without it every two-stage intermediate
@@ -2114,6 +3874,52 @@ class MuseMinimaxDirector:
 
             final_images = torch.cat(all_images, dim=0) if len(all_images) > 1 else all_images[0]
             final_audio = {"waveform": all_waveform, "sample_rate": audio_sample_rate}
+
+            # 2026-09-04: "Embed this clip's real audio over the final output" — a
+            # literal post-generation overlay, distinct from Audio State's
+            # fully_copy (which still asks H3 to GENERATE matching audio, only as
+            # faithful as the model's own compliance). Runs once here, after every
+            # chunk is generated and stitched, replacing final_audio outright
+            # rather than touching anything upstream — simplest correct place for
+            # it, and works identically whether this pass was one chunk or several.
+            # user_ref_videos is the enclosing execute()'s own list, read here via
+            # closure like everywhere else in _run_pass. First flagged entry wins
+            # if more than one video somehow has this on — there's only one final
+            # audio track to fill, so a second flagged entry would just be ignored
+            # here rather than silently overwriting the first.
+            overlay_entry = next((e for _t, _p, e, _idx in user_ref_videos if e.get("overlayOriginalAudio")), None)
+            if overlay_entry is not None:
+                total_seconds = final_images.shape[0] / 24.0
+                overlay_start = float(overlay_entry.get("trimStartSec", 0) or 0)
+                overlay_window = dict(overlay_entry)
+                overlay_window["trimStartSec"] = overlay_start
+                overlay_window["trimEndSec"] = overlay_start + total_seconds
+                overlay_audio = _load_ref_audio_clip(overlay_window)
+                if overlay_audio is not None:
+                    final_audio = overlay_audio
+                    log.info("[MuseMinimaxDirector] Embedding %.2fs of the original audio from %s over the "
+                             "final output, bypassing whatever H3 itself generated for the audio track.",
+                             total_seconds, overlay_entry.get("fileName", "the reference video"))
+                else:
+                    log.warning("[MuseMinimaxDirector] 'Embed this clip's real audio' was on but the source "
+                                "audio couldn't be loaded — keeping H3's own generated audio instead.")
+
+            # Piggyback the raw keyframe pixel images + frame count onto the LATENT
+            # dict itself (same established pattern as the scout-bundle marker right
+            # below — a plain dict, extra keys are inert to anything that doesn't know
+            # about them) rather than adding new output sockets — Refine V1.3 already
+            # receives this dict via candidate_N_latent, so no new wiring is needed for
+            # it to also pick these up. None/None for Reference (Omni) mode.
+            if last_chunk_stage1_latent is not None:
+                last_chunk_stage1_latent = dict(last_chunk_stage1_latent)
+                last_chunk_stage1_latent["_muse_keyframe_first_frame"] = last_chunk_first
+                last_chunk_stage1_latent["_muse_keyframe_last_frame"] = last_chunk_last
+                last_chunk_stage1_latent["_muse_keyframe_frame_count"] = last_chunk_frame_count
+                # Not saved into the per-chunk scout .pt files (a MODEL object is large
+                # and identical across every chunk of one candidate anyway) — carried
+                # once here instead, on the dict Refine actually receives via
+                # candidate_N_latent regardless of whether Latent-Only Scouting is on.
+                last_chunk_stage1_latent["_muse_model_used"] = last_chunk_shifted_model
 
             # Latent-Only Scouting, multi-chunk timeline: last_chunk_stage1_latent is
             # only ever this pass's LAST chunk on its own — real, but incomplete, since
@@ -2148,12 +3954,25 @@ class MuseMinimaxDirector:
         # consulted here (even though it's still a real widget, kept only so old saved
         # workflows don't misalign) — if its stored value were ever left on with no
         # visible control to see or undo it, it would silently force every candidate on.
-        # candidate_2/3/4 are the only things that decide this now.
-        run_candidate = [False, candidate_2, candidate_3, candidate_4]
-        any_candidate = any(run_candidate[1:])
+        # candidate_total (already forced to 1 above whenever enable_seed_hunt is off)
+        # decides which EXTRA passes run, always sequential — candidate_total=3 means
+        # candidates 1,2,3 run, never e.g. 1+3 with 2 skipped. any_candidate is
+        # enable_seed_hunt directly, not derived from whether an extra pass actually
+        # ran — a real, reported problem otherwise: Seed Hunt explicitly turned on but
+        # left at candidate_count=1 must still count as a Seed Hunt session (main
+        # images/audio blocked, output on candidate_1 only), not silently fall back to
+        # behaving like Seed Hunt was off just because no extra pass happened to run.
+        run_candidate = [False, candidate_total >= 2, candidate_total >= 3, candidate_total >= 4]
+        any_candidate = bool(enable_seed_hunt)
         if any_candidate:
-            log.warning("[MuseMinimaxDirector] Running %d additional full pass(es) at identical "
-                        "settings, different seeds only.", sum(run_candidate[1:]))
+            extra_passes = sum(run_candidate[1:])
+            if extra_passes > 0:
+                log.warning("[MuseMinimaxDirector] Running %d additional full pass(es) at identical "
+                            "settings, different seeds only.", extra_passes)
+            else:
+                log.warning("[MuseMinimaxDirector] Seed Hunt is on with candidate_count=1 — only the "
+                            "main candidate runs, but this is still a scouting session: main images/"
+                            "audio stay blocked, output is on candidate_1 only.")
             for i in range(1, 4):
                 if not run_candidate[i]:
                     continue
@@ -2162,9 +3981,6 @@ class MuseMinimaxDirector:
                 candidate_images[i] = c_images
                 candidate_audio[i] = c_audio
                 candidate_latents[i] = c_latent
-
-        empty_images = torch.zeros((0, height, width, 3))
-        empty_audio = {"waveform": torch.zeros((1, 1, 0)), "sample_rate": 44100}
 
         # Seed Hunt is a scouting run, not a final one — main images/audio only ever
         # mean "the one real generation" when no extra candidate ran. With one or more
@@ -2177,8 +3993,8 @@ class MuseMinimaxDirector:
         # execution.py's execution_block_cb) — ExecutionBlocker(None) blocks silently
         # instead; this log line is the only visible trace, in the console, not a popup.
         if any_candidate:
-            log.info("[MuseMinimaxDirector] One or more extra candidates ran — main images/audio "
-                      "outputs are blocked (not a picked result). Use candidate_1..4 instead.")
+            log.info("[MuseMinimaxDirector] Seed Hunt is on — main images/audio outputs are blocked "
+                      "(not a picked result). Use candidate_1..4 instead.")
             main_images = ExecutionBlocker(None)
             main_audio = ExecutionBlocker(None)
         else:
@@ -2186,24 +4002,57 @@ class MuseMinimaxDirector:
 
         # Only meaningful when two_stage_seed_hunt_latent_only is on (that's the only
         # path that ever populates chunk_stage1_latent) — otherwise every candidate's
-        # latent is None here. Same silent-block convention as main_images/main_audio
-        # above rather than a fake empty LATENT, since a scouting latent that was never
-        # actually generated has nothing sensible to hand downstream either way.
+        # latent is None here.
+        #
+        # Deliberately NOT ExecutionBlocker here, unlike main_images/main_audio and
+        # candidate_images_out/candidate_audio_out below — those each feed exactly one
+        # dedicated downstream consumer per candidate, so blocking an unrun candidate's
+        # own branch is harmless and correctly scoped. All four candidate_N_latent
+        # outputs, though, feed a SINGLE shared node (Muse Minimax Refine) at once,
+        # regardless of which one is actually picked — and ComfyUI's own executor
+        # skips a node's function entirely if ANY of its inputs is an ExecutionBlocker
+        # (confirmed directly in execution.py's process_inputs: it scans every input
+        # first and bails before ever calling the node if it finds one), not just the
+        # unused one. So with fewer than 4 candidates run, 2-3 of Refine's four latent
+        # inputs would always be blockers, silently preventing Refine from running at
+        # all no matter which (even a real, fully-generated) candidate was picked —
+        # confirmed directly: a real 2-candidate run correctly generated candidates 1
+        # and 2, yet picking candidate 1 in Refine still did nothing, with no warning
+        # anywhere, because Refine's own execute() was never even called. A plain
+        # marker dict avoids that framework-level trap; Refine checks for the marker
+        # itself (see its own chosen_latent-is-unfilled check) and blocks cleanly only
+        # when the specific candidate actually picked is the unfilled one.
         candidate_latents_out = [
-            lat if lat is not None else ExecutionBlocker(None) for lat in candidate_latents
+            lat if lat is not None else {"samples": None, "_muse_candidate_not_generated": True}
+            for lat in candidate_latents
+        ]
+
+        # candidates 2-4 that didn't run (candidate_total too low) used to fall back to
+        # a genuinely valid but zero-length IMAGE/AUDIO tensor here — technically not
+        # None, so a downstream Save/Preview node would happily "succeed" on 0 frames
+        # rather than stop, and its on-screen thumbnail would just keep showing
+        # whatever it last displayed from an earlier run. That stale thumbnail is
+        # easy to mistake for real output from THIS run (confirmed directly: a user's
+        # candidate 2/3 preview cards still showed a completely different outfit from
+        # a prior run after a pass that only generated candidates 1 and 4). Now uses
+        # the exact same ExecutionBlocker convention as the latents above, so an unrun
+        # candidate's image/audio outputs stop cleanly instead of silently no-op'ing.
+        candidate_images_out = [
+            img if img is not None else ExecutionBlocker(None) for img in candidate_images
+        ]
+        candidate_audio_out = [
+            aud if aud is not None else ExecutionBlocker(None) for aud in candidate_audio
         ]
 
         return (
             main_images, main_audio, compiled_prompt_text, ref_images_used,
-            candidate_images[0], candidate_audio[0],
-            candidate_images[1] if candidate_images[1] is not None else empty_images,
-            candidate_audio[1] if candidate_audio[1] is not None else empty_audio,
-            candidate_images[2] if candidate_images[2] is not None else empty_images,
-            candidate_audio[2] if candidate_audio[2] is not None else empty_audio,
-            candidate_images[3] if candidate_images[3] is not None else empty_images,
-            candidate_audio[3] if candidate_audio[3] is not None else empty_audio,
+            candidate_images_out[0], candidate_audio_out[0],
+            candidate_images_out[1], candidate_audio_out[1],
+            candidate_images_out[2], candidate_audio_out[2],
+            candidate_images_out[3], candidate_audio_out[3],
             candidate_latents_out[0], candidate_latents_out[1],
             candidate_latents_out[2], candidate_latents_out[3],
+            ref_audio_1_used, ref_audio_2_used, ref_audio_3_used,
         )
 
 
@@ -2358,11 +4207,11 @@ _AUDIO_RETENTION_INSTRUCTIONS = {
         "dialogue performed in a similar voice, not the literal recording)"
     ),
     "fully_copy": (
-        "add one line to subject_definitions: <Audio {a}> is the Subject's spoken dialogue, "
-        "reused verbatim from this exact recording. And one line to retention_analysis: "
-        "<Audio {a}>: fully_copy - the Subject's performance and lip movements match this "
-        "exact recording. This is driving dialogue, not invented speech — write this Subject's "
-        "shot around the real recorded performance."
+        "add one line to subject_definitions: <Audio {a}> is the complete source audio and exact "
+        "performance timeline for the Subject. And use MiniMax H3's exact retention form: "
+        "<Audio {a}>: fully_copy - <Audio {a}> is reused 1:1 as the target video's complete final "
+        "audio track. This is driving audio, not invented speech or regenerated music — write this "
+        "Subject's shot around the real recorded performance."
     ),
     "partially_copy": (
         "add one line to subject_definitions: <Audio {a}> is a partial voice reference for "
@@ -2422,7 +4271,7 @@ def _muse_minimax_promptgen_audio_instruction(speaker_audio_map):
     )
 
 
-@PromptServer.instance.routes.post("/muse_minimax_director_v1_2/generate_scene_prompt")
+@PromptServer.instance.routes.post("/muse_minimax_director_v1_4/generate_scene_prompt")
 async def muse_minimax_generate_scene_prompt_endpoint(request):
     try:
         data = await request.json()
@@ -2525,32 +4374,69 @@ def _muse_minimax_get_whisper_model(model_size):
     return _MUSE_MINIMAX_WHISPER_MODEL_CACHE[model_size]
 
 
-def _muse_minimax_transcribe_sync(audio_path, model_size):
+def _muse_minimax_transcribe_sync(audio_path, model_size, trim_start_sec=0.0, trim_end_sec=None):
     """Runs on a worker thread (see run_in_executor below) — blocking CPU work,
     must never run directly on the aiohttp event loop. Returns Whisper's own
     sentence/pause-based segments (start/end/text), which is exactly the real
     pacing information used to build accurately-timed [Shot N] At MM:SS.mmm
     breaks or timed CUTs, rather than one flat undifferentiated transcript."""
     model = _muse_minimax_get_whisper_model(model_size)
-    segments_gen, _info = model.transcribe(audio_path, word_timestamps=True)
+    # Whisper must see the exact same time window selected on the main Ref Audio
+    # card, even when it reads an optional aligned vocals-only stem. Passing the
+    # complete stem here while H3 received only [In, Out) was a silent source of
+    # timestamp drift. faster-whisper accepts a mono float32 numpy waveform, so
+    # reuse the node's established PyAV trimming/decoding path and make timestamps
+    # naturally relative to the beginning of the selected generation window.
+    audio_input = audio_path
+    if float(trim_start_sec or 0.0) > 0.0 or trim_end_sec is not None:
+        trimmed = _load_ref_audio_clip({
+            "file": audio_path,
+            "trimStartSec": float(trim_start_sec or 0.0),
+            "trimEndSec": trim_end_sec,
+        }, target_sr=16000)
+        if trimmed is None:
+            raise ValueError("Could not decode the selected transcription-audio window.")
+        waveform = trimmed["waveform"].detach().cpu().float()
+        while waveform.ndim > 2:
+            waveform = waveform.squeeze(0)
+        if waveform.ndim == 2:
+            waveform = waveform.mean(dim=0)
+        audio_input = waveform.contiguous().numpy()
+    segments_gen, _info = model.transcribe(audio_input, word_timestamps=True)
     segments = []
     full_text_parts = []
     for seg in segments_gen:
         text = (seg.text or "").strip()
         if not text:
             continue
-        segments.append({"start": float(seg.start), "end": float(seg.end), "text": text})
+        words = []
+        for word in (getattr(seg, "words", None) or []):
+            word_text = getattr(word, "word", "") or ""
+            if not word_text.strip():
+                continue
+            words.append({
+                "start": float(word.start),
+                "end": float(word.end),
+                "text": word_text,
+            })
+        segments.append({
+            "start": float(seg.start), "end": float(seg.end), "text": text,
+            "words": words,
+        })
         full_text_parts.append(text)
     return segments, " ".join(full_text_parts)
 
 
-@PromptServer.instance.routes.post("/muse_minimax_director_v1_2/transcribe_audio")
+@PromptServer.instance.routes.post("/muse_minimax_director_v1_4/transcribe_audio")
 async def muse_minimax_transcribe_audio_endpoint(request):
     try:
         import asyncio
         data = await request.json()
         rel_path = data.get("file") or ""
         model_size = data.get("whisper_model") or "small"
+        trim_start_sec = float(data.get("trim_start_sec") or 0.0)
+        trim_end_raw = data.get("trim_end_sec")
+        trim_end_sec = float(trim_end_raw) if trim_end_raw is not None else None
         if model_size not in _MUSE_MINIMAX_WHISPER_MODEL_SIZES:
             model_size = "small"
 
@@ -2564,7 +4450,8 @@ async def muse_minimax_transcribe_audio_endpoint(request):
         log.info("[MuseMinimaxDirector] Transcribing %s with Whisper '%s' (CPU)...", audio_path, model_size)
         loop = asyncio.get_event_loop()
         segments, full_text = await loop.run_in_executor(
-            None, _muse_minimax_transcribe_sync, audio_path, model_size)
+            None, _muse_minimax_transcribe_sync, audio_path, model_size,
+            trim_start_sec, trim_end_sec)
 
         if not segments:
             return web.json_response({"status": "error", "message": "No speech detected in this audio."})
@@ -2583,9 +4470,9 @@ async def muse_minimax_transcribe_audio_endpoint(request):
 
 
 NODE_CLASS_MAPPINGS = {
-    "MuseMinimaxDirectorV1_2": MuseMinimaxDirector,
+    "MuseMinimaxDirectorV1_4": MuseMinimaxDirector,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "MuseMinimaxDirectorV1_2": "Muse Minimax Director V1.2 (Two-Stage)",
+    "MuseMinimaxDirectorV1_4": "Muse MiniMax Director V1.4",
 }
