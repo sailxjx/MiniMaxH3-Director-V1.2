@@ -750,6 +750,13 @@ function injectStyles() {
      dialogue without forcing the textarea to scroll after only a few lines. */
   .mmd-track { height: 420px; }
   .mmd-cut-label, .mmd-cut-speaker-row label { font-size: 34px !important; }
+  /* [2026-09-05] The drag/delete icons on each CUT block never got included in
+     this readability-scale pass — they stayed at their original fixed 14px
+     while the CUT label text next to them grew to 34px, so at normal overview
+     zoom they were nearly invisible next to their own label. Match them to
+     the same scale as .mmd-cut-label above. */
+  .mmd-cut-actions { gap: 16px !important; }
+  .mmd-cut-actions svg { width: 32px !important; height: 32px !important; }
   .mmd-cut-duration-input, .mmd-speaker-chip { font-size: 28px !important; }
   .mmd-add-cut-bar, .mmd-add-chunk-bar, .mmd-delete-chunk-bar,
   .mmd-promptgen-btn, .mmd-analyze-btn, .mmd-add-location-btn { font-size: 34px !important; }
@@ -1730,10 +1737,31 @@ class MinimaxTimelineEditor {
     });
     updateFill();
 
+    // [2026-09-05] Added: this slider/number pair is only synced from the
+    // widget's value here, at construction time — nothing re-reads widget.value
+    // afterward. Code elsewhere (Add Chunk / Delete Chunk / auto-insert-for-
+    // video) sets widget.value directly to grow/shrink Total Duration without
+    // going through this row's own slider/number inputs, so the on-screen
+    // number went stale — the underlying value was actually correct, the
+    // display just never got told to catch up. Stash a sync function on the
+    // widget itself so any code that changes widget.value programmatically can
+    // call _syncWidgetSliderUI(widget) right after, and this row (and any
+    // other _sliderRow built for the same widget) updates immediately.
+    widget._mmdSyncUI = (val) => {
+      slider.value = val;
+      number.value = val;
+      updateFill();
+    };
+
     trackRow.appendChild(slider);
     trackRow.appendChild(number);
     rowEl.appendChild(trackRow);
     return rowEl;
+  }
+
+  // [2026-09-05] Added — see the _mmdSyncUI comment in _sliderRow above.
+  _syncWidgetSliderUI(widget) {
+    if (widget && widget._mmdSyncUI) widget._mmdSyncUI(widget.value);
   }
 
   _numberRow(labelText, widget, onChange) {
@@ -2064,6 +2092,7 @@ class MinimaxTimelineEditor {
     const totalWidget = this.realWidgets.duration_seconds;
     if (totalWidget) {
       totalWidget.value = Math.round(needed * 10) / 10;
+      this._syncWidgetSliderUI(totalWidget);
     }
     entry.continueAcrossChunks = true;
     const added = chunksNeeded - before;
@@ -2080,6 +2109,7 @@ class MinimaxTimelineEditor {
     const totalWidget = this.realWidgets.duration_seconds;
     if (totalWidget) {
       totalWidget.value = Math.round((this.durationSeconds + this.chunkSizeSeconds) * 10) / 10;
+      this._syncWidgetSliderUI(totalWidget);
     }
     this.timeline.chunks.push(this._blankChunk());
     this._syncChunkCount();
@@ -2107,6 +2137,7 @@ class MinimaxTimelineEditor {
       totalWidget.value = Math.max(
         this.chunkSizeSeconds, Math.round((this.durationSeconds - this.chunkSizeSeconds) * 10) / 10,
       );
+      this._syncWidgetSliderUI(totalWidget);
     }
     this._syncChunkCount();
     this.renderTimeline();

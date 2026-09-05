@@ -6,7 +6,7 @@ Built by [Muse Collective](https://musecollective.co.uk) — write a single flow
 
 This is a fork of [Muse Minimax Director](https://github.com/muse-collective-26/MiniMaxH3-Director) that adds independent per-candidate **Seed Hunt** toggles — scout up to 4 candidate seeds in one run at low resolution, then pick the best one and continue it at full resolution with the bundled [Muse Minimax Refine](#muse-minimax-refine-bundled) node — plus two-stage sampling and a VAE re-encode continuity mode that eliminates the visible jump at chunk boundaries on multi-chunk renders (see [Changelog](#changelog) and [Chunk continuity, in detail](#chunk-continuity-in-detail)). The original repo stays as the simpler, single-generation version; this one is for anyone who wants the scouting workflow, longer multi-chunk renders, or both.
 
-This repository bundles **two** ComfyUI nodes — Muse Minimax Director V1.4 and its companion Muse Minimax Refine V1.4 (Beta-matched) — installed together as one package. See [Muse Minimax Refine (bundled)](#muse-minimax-refine-bundled) below for what it does and how to wire it up.
+This repository bundles **two** ComfyUI nodes — Muse Minimax Director V1.4 and its companion Muse Minimax Refine V2 (Beta-matched) — installed together as one package. See [Muse Minimax Refine (bundled)](#muse-minimax-refine-bundled) below for what it does and how to wire it up.
 
 ![ComfyUI Custom Node](https://img.shields.io/badge/ComfyUI-Custom%20Node-orange?style=flat-square)
 ![MiniMax H3](https://img.shields.io/badge/MiniMax-H3-blue?style=flat-square)
@@ -15,6 +15,12 @@ This repository bundles **two** ComfyUI nodes — Muse Minimax Director V1.4 and
 ---
 
 ## Changelog
+
+### v3.1.0 — 2026-09-05
+- **Reinstated Muse Minimax Refine V2 (Beta-matched) as this repository's one supported Refine node, reversing v3.0.0's retirement of it.** V2 is the node that actually matches this Director's own Two-Stage/Seed Hunt scouting mechanism — Refine V14 was shipped in v3.0.0 only because V2 had been lost to an accidental deletion at the time, not because it was the better fit. V2 has since been fully recovered (verified byte-for-byte against its own last compiled bytecode) and is the node going forward; V14, plain Refine, and Muse Model Route are no longer part of this package.
+- **Fixed: `raw_latent_carry_test` on Refine V2 was silently ignored — the widget's real value never reached the actual carry logic.** `execute()` always passed a hardcoded `False` into the continuity code regardless of what the checkbox showed, so every multi-chunk refine silently fell back to the weaker pixel-VAE-reencoded carry no matter how it was set. This is very likely the real cause of an audible quality drop (garbled dialogue) right at a chunk seam on refined output. Also corrected the widget's own default (was `False`, contradicting the node's own module docstring, which already said it defaults on) to `True`, matching the Director's own default for the same setting.
+- **Fixed a real VRAM stall on Low VRAM profile, Seed Hunt with 2+ candidates.** The shared memory-reservation system (H3AutoReserve, in the separate `ComfyUI-H3-Multishot` dependency) only ever ran its leftover-VRAM cleanup sweep on a given render shape's first pass in a session — every repeat candidate at the same resolution (which Seed Hunt always produces) skipped that sweep entirely, inheriting whatever was left resident from the previous candidate instead of a clean pool. Under real memory pressure (Low VRAM + GGUF) this reproduced as a full lock-up at 100% GPU with no progress, not just a slowdown. Fixed at the point that's actually re-entered per candidate — the Director's own Seed Hunt loop now resets that reservation system's memory before every extra candidate pass, confirmed by a full clean 4-candidate run with no stall (also holds steady, no accumulation, on Maximum Quality).
+- **UI:** the drag/delete icons on each CUT block were stuck at their original small fixed size while the CUT label text next to them was already scaled up for overview readability — now sized to match. Also fixed the Generation card's Total Duration display going stale after Add Chunk / Delete Chunk (and the auto-insert-chunks-for-video shortcut) — those already correctly updated the underlying value, the on-screen slider/number next to it just never got told to refresh; it now does.
 
 ### v3.0.0
 - **Fixed: reference videos were silently capped at 200 frames total, regardless of how long a trim window was actually requested.** A 30fps clip trimmed to 10 seconds needs 300 frames to cover that window; the old flat cap stopped decoding at 200 (~6.67s), so the back third of every reference video's motion was never loaded into the tensor H3 actually received — no error, no warning, just an incomplete reference. This was the real root cause of a reference video's motion appearing to be "followed for a few seconds, then abandoned," regardless of any prompt wording changed around it.
@@ -138,9 +144,9 @@ MiniMax H3 is a strong omni-modal model, but its native inputs are low-level: nu
 | Node | Display name | Description |
 |------|---------------|-------------|
 | `MuseMinimaxDirectorV14` | Muse Minimax Director V1.4 (Two-Stage) | Timeline-based director for MiniMax H3 — chunking, prompt compilation, Seed Hunt scouting, continuity |
-| `MuseMinimaxRefineV14` | Muse Minimax Refine V1.4 (Beta-matched) | Companion second-pass node — continues a picked Seed Hunt candidate's own sigma schedule at a higher resolution (see [Muse Minimax Refine (bundled)](#muse-minimax-refine-bundled)) |
+| `MuseMinimaxRefineV2` | Muse Minimax Refine V2 (Beta-matched) | Companion second-pass node — continues a picked Seed Hunt candidate's own sigma schedule at a higher resolution (see [Muse Minimax Refine (bundled)](#muse-minimax-refine-bundled)) |
 
-Plain Refine, Refine V1.3, Refine V2, and Muse Model Route (a tiny MODEL-routing utility used by an older example workflow) were retired from this package in v3.0.0 — see the [Changelog](#changelog). None are gone from existence, just no longer bundled here.
+Plain Refine, Refine V1.3, Refine V14, and Muse Model Route (a tiny MODEL-routing utility used by an older example workflow) are not part of this package — see the [Changelog](#changelog) for why V2 is the one shipped here. None are gone from existence, just no longer bundled here.
 
 ---
 
@@ -440,7 +446,7 @@ An earlier version used three independent per-candidate toggles instead of a cou
 
 ## Muse Minimax Refine (bundled)
 
-`MuseMinimaxRefineV14` is the companion second-pass node bundled in this same repository (see [Nodes included](#nodes-included)) — a standalone continuation node, not a modification of the Director. It picks up a chosen Seed Hunt candidate's own sigma schedule exactly where Stage 1 left off and finishes it at a higher resolution — a genuine latent continuation, not a from-pixels img2img re-sample, so nothing about the candidate's own content changes, only its resolution.
+`MuseMinimaxRefineV2` is the companion second-pass node bundled in this same repository (see [Nodes included](#nodes-included)) — a standalone continuation node, not a modification of the Director. It picks up a chosen Seed Hunt candidate's own sigma schedule exactly where Stage 1 left off and finishes it at a higher resolution — a genuine latent continuation, not a from-pixels img2img re-sample, so nothing about the candidate's own content changes, only its resolution.
 
 **Inputs**, beyond `model`/`clip`/`vae`/`audio_vae`:
 - `prompt` — wire the Director's `compiled_prompt` output. Reused as-is for a single-chunk candidate; ignored for a multi-chunk one (each chunk already carries its own saved prompt — see below).

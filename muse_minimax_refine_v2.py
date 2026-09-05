@@ -1,5 +1,5 @@
 """
-Muse Minimax Refine V1.4 — finishes a Seed Hunt candidate scouted by
+Muse Minimax Refine V2 — finishes a Seed Hunt candidate scouted by
 MuseMinimaxDirectorV1_2TwoStageBeta (the "TwoStage-Beta" package), instead of the
 plain MuseMinimaxDirector V1.2 candidates V1.3 targets.
 
@@ -40,7 +40,6 @@ scout-bundle-saving code is identical in shape to V1.2's.
 """
 
 import logging
-import math
 import os
 
 import comfy.samplers
@@ -48,7 +47,7 @@ import comfy.utils
 import folder_paths
 import torch
 
-from comfy_extras.nodes_minimax_h3 import MiniMaxH3ImageToVideo, MiniMaxH3ReferenceToVideo, CANVAS_MULTIPLE, REF_IMAGE_SHORT_EDGE, align_frame_count, _resize
+from comfy_extras.nodes_minimax_h3 import MiniMaxH3ImageToVideo, MiniMaxH3ReferenceToVideo, CANVAS_MULTIPLE, align_frame_count, _resize
 from comfy_execution.graph import ExecutionBlocker
 import node_helpers
 
@@ -57,9 +56,9 @@ log = logging.getLogger(__name__)
 
 # ── Learned latent upscaler model registration ──────────────────────────────
 # Duplicated from the Beta Director rather than imported from it — this package
-# must keep working standalone (V1.3's own stated reason for duplicating its
-# helpers applies just as much here), and importing across custom_nodes packages
-# is fragile (load order, the other package not being installed at all).
+# must keep working standalone, and importing across custom_nodes packages is
+# fragile (load order, the other package not being installed at all, version
+# drift between the two copies).
 _LATENT_UPSCALE_MODEL_FOLDER = "latent_upscale_models"
 if _LATENT_UPSCALE_MODEL_FOLDER not in folder_paths.folder_names_and_paths:
     folder_paths.add_model_folder_path(
@@ -116,14 +115,14 @@ def _load_scout_chunk(path):
         return torch.load(path, map_location="cpu")
 
 
-def _rebuild_keyframe_conditioning(positive, vae, first_frame, last_frame, tgt_w_px, tgt_h_px, frame_count, guide_frames=None):
+def _rebuild_keyframe_conditioning(positive, vae, first_frame, last_frame, tgt_w_px, tgt_h_px, frame_count):
     """Mirrors MuseMinimaxDirector's own _rebuild_keyframe_conditioning_for_stage2 exactly
     (same resize conventions, same conditioning keys) — ported here rather than imported,
     same reasoning V1.3 already documents for its own copy of this function."""
-    if first_frame is None and last_frame is None and not guide_frames:
+    if first_frame is None and last_frame is None:
         return positive
     if frame_count is None:
-        log.warning("[MuseMinimaxRefineV14] Keyframe image(s) were provided but no frame_count came with "
+        log.warning("[MuseMinimaxRefineV2] Keyframe image(s) were provided but no frame_count came with "
                     "them — skipping the keyframe conditioning rebuild. Refining without the "
                     "First/Last-Frame lock.")
         return positive
@@ -131,97 +130,12 @@ def _rebuild_keyframe_conditioning(positive, vae, first_frame, last_frame, tgt_w
     if first_frame is not None:
         img = _resize(first_frame[:1], tgt_w_px, tgt_h_px, "disabled")
         new_keyframes.append({"resolved_frame_index": 0, "latent": vae.encode(img)})
-    for guide in (guide_frames or []):
-        image = guide.get("image")
-        if image is None:
-            continue
-        img = _resize(image[:1], tgt_w_px, tgt_h_px, "center")
-        new_keyframes.append({"resolved_frame_index": int(guide["frame_idx"]), "latent": vae.encode(img)})
 
     # Deliberately do not re-encode the supplied last frame at Stage 2. Stage 1 has
     # already used it to shape the trajectory; imposing a fresh high-resolution copy
     # here caused the generated approach to snap back to the source image near the end.
     return node_helpers.conditioning_set_values(
         positive, {"minimax_keyframes": new_keyframes, "minimax_frame_count": frame_count})
-
-
-def _latent_resize_ref_block(blk, tgt_w_latent, tgt_h_latent):
-    """Legacy-fallback path for one visual minimax_refs block: no original source
-    pixel is available to re-encode fresh, so just latent-space resize the EXISTING
-    (Stage-1-resolution) latent up to the Stage-2 canvas and correct its latent_h/
-    latent_w bookkeeping to match. Keeps the block's own metadata self-consistent
-    and raises its token density, but — unlike a fresh re-encode — cannot recover
-    any detail the Stage-1 encode never captured. Mirrors Director's own copy of
-    this function exactly (see its docstring there for the full reasoning)."""
-    old_samples = blk["latent"]["samples"] if isinstance(blk["latent"], dict) else blk["latent"]
-    new_samples = comfy.utils.common_upscale(
-        old_samples, int(tgt_w_latent), int(tgt_h_latent), "bicubic", "disabled")
-    new_blk = dict(blk)
-    new_blk["latent"] = {"samples": new_samples} if isinstance(blk["latent"], dict) else new_samples
-    new_blk["latent_h"] = int(tgt_h_latent)
-    new_blk["latent_w"] = int(tgt_w_latent)
-    return new_blk
-
-
-def _rebuild_refs_conditioning_for_stage2(positive, vae, tgt_w_latent, tgt_h_latent,
-                                          ref_image_size="match", ref_images_dict=None,
-                                          log_label=""):
-    """Mirrors MuseMinimaxDirector's own _rebuild_refs_conditioning_for_stage2 exactly
-    (same sizing rule, same fresh-reencode-with-legacy-fallback shape) — ported here
-    rather than imported, same reasoning this file already documents for its own copy
-    of _rebuild_keyframe_conditioning. Only image refs need handling here: refine's
-    own MiniMaxH3ReferenceToVideo call above never wires ref_videos in at all (video-
-    ref support doesn't exist in this node), so minimax_refs can only ever contain
-    image and/or audio blocks by construction — audio blocks pass through unchanged.
-
-    ref_images_dict here is the exact same dict that built `positive` a few lines
-    above in _refine_one_chunk_beta — not a separately-persisted original, so the
-    'legacy fallback' branch below is mostly defensive: it only fires if a block in
-    positive's minimax_refs has no corresponding entry in ref_images_dict at all,
-    which in practice means ref_images_dict changed shape between building positive
-    and calling this function. Kept anyway, logged distinctly, rather than assuming
-    it can never happen."""
-    existing_refs = positive[0][1].get("minimax_refs") if positive else None
-    if not existing_refs:
-        return positive
-
-    orig_images = list((ref_images_dict or {}).values())
-    tgt_w_px, tgt_h_px = int(tgt_w_latent) * 16, int(tgt_h_latent) * 16
-    img_cursor = 0
-    fresh_count, fallback_count = 0, 0
-    new_refs = []
-    for blk in existing_refs:
-        if blk.get("kind") != "image":
-            new_refs.append(blk)
-            continue
-        src = orig_images[img_cursor] if img_cursor < len(orig_images) else None
-        img_cursor += 1
-        if src is None:
-            new_refs.append(_latent_resize_ref_block(blk, tgt_w_latent, tgt_h_latent))
-            fallback_count += 1
-            continue
-        h, w = src.shape[1], src.shape[2]
-        if ref_image_size == "match":
-            scale = min(1.0, math.sqrt((tgt_w_px * tgt_h_px) / (w * h)))
-        else:
-            scale = min(1.0, REF_IMAGE_SHORT_EDGE / min(w, h))
-        tw = max(CANVAS_MULTIPLE, round(w * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
-        th = max(CANVAS_MULTIPLE, round(h * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
-        resized = _resize(src[:1], tw, th, "disabled")
-        z = vae.encode(resized)
-        new_blk = dict(blk)
-        new_blk["latent_h"], new_blk["latent_w"], new_blk["latent"] = th // 16, tw // 16, z
-        new_refs.append(new_blk)
-        fresh_count += 1
-
-    if fresh_count:
-        log.info("[MuseMinimaxRefineV14] %s: freshly re-encoded %d Stage-2 visual "
-                  "reference(s) from source pixels.", log_label, fresh_count)
-    if fallback_count:
-        log.info("[MuseMinimaxRefineV14] %s: scaled %d existing reference latent(s) "
-                  "as legacy fallback (no original source pixels in scope).", log_label, fallback_count)
-
-    return node_helpers.conditioning_set_values(positive, {"minimax_refs": new_refs})
 
 
 def _rebuild_stage1_continuation(model, clip, vae, audio_vae, prompt, old_stage1_latent,
@@ -244,6 +158,16 @@ def _rebuild_stage1_continuation(model, clip, vae, audio_vae, prompt, old_stage1
     old_video = _unpack_node_result(_execute_comfy_node(SeparateAV, av_latent=old_stage1_latent))[0]
     samples = old_video["samples"]
     width, height = int(samples.shape[-1]) * 16, int(samples.shape[-2]) * 16
+
+    # Free the main DiT before the text encoder loads for this rebuild's own prompt —
+    # same fix as _refine_one_chunk_beta's own copy of this pattern.
+    try:
+        import comfy.model_management as _mm
+        _mm.unload_all_models()
+    except Exception:
+        log.warning("[MuseMinimaxRefineV2] sequential Stage-1 rebuild: could not "
+                    "unload before text encoding — continuing anyway.")
+
     positive, latent = _unpack_node_result(_execute_comfy_node(
         MiniMaxH3ImageToVideo, clip=clip, vae=vae, prompt=prompt,
         width=width, height=height, length=int(frame_count),
@@ -264,6 +188,15 @@ def _rebuild_stage1_continuation(model, clip, vae, audio_vae, prompt, old_stage1
         MaskedContext, latent=latent, source_latent=source_latent,
         context_length=carry_n, audio_feather_ticks=8))[0]
 
+    # Free the text encoder before the DiT needs to reload for sampling — mirrored
+    # handoff back the other way, same as _refine_one_chunk_beta's own copy.
+    try:
+        import comfy.model_management as _mm
+        _mm.unload_all_models()
+    except Exception:
+        log.warning("[MuseMinimaxRefineV2] sequential Stage-1 rebuild: could not "
+                    "unload before sampling — continuing anyway.")
+
     guider = _unpack_node_result(_execute_comfy_node(BasicGuider, model=model, conditioning=positive))[0]
     full_sigmas = _unpack_node_result(_execute_comfy_node(
         BasicScheduler, model=model, scheduler=scheduler, steps=steps, denoise=1.0))[0]
@@ -280,7 +213,7 @@ def _rebuild_stage1_continuation(model, clip, vae, audio_vae, prompt, old_stage1
     rebuilt["_muse_two_stage_raw_audio"] = raw_audio
     rebuilt["_muse_seed_used"] = int(seed)
     rebuilt["_muse_first_pass_steps_used"] = int(split_step)
-    log.info("[MuseMinimaxRefineV14] sequential Stage-1 rebuild: %d frames, seed=%d, steps=%d",
+    log.info("[MuseMinimaxRefineV2] sequential Stage-1 rebuild: %d frames, seed=%d, steps=%d",
              int(frame_count), int(seed), int(split_step))
     return rebuilt
 
@@ -288,7 +221,7 @@ def _refine_one_chunk_beta(
     model, clip, vae, audio_vae, chunk_prompt, chunk_latent,
     ref_image_size, seed, steps, two_stage_first_pass_steps,
     sampler_name, scheduler, two_stage_latent_upscale_model, two_stage_target_megapixels,
-    ref_images_dict, ref_audios_dict, first_frame, last_frame, frame_count, guide_frames,
+    ref_images_dict, ref_audios_dict, first_frame, last_frame, frame_count,
     carry_images, carry_audio, carry_length,
     raw_latent_carry_test, carry_context_latent,
     log_label,
@@ -314,7 +247,7 @@ def _refine_one_chunk_beta(
     MiniMaxH3GeneratedAVMaskedContext = NODE_CLASS_MAPPINGS.get("MiniMaxH3GeneratedAVMaskedContext")
     MinimaxH3LatentUpscaler3D = NODE_CLASS_MAPPINGS.get("MinimaxH3LatentUpscaler3D")
     if MinimaxH3LatentUpscaler3D is None:
-        raise RuntimeError("[MuseMinimaxRefineV14] 'MinimaxH3LatentUpscaler3D' isn't registered — install "
+        raise RuntimeError("[MuseMinimaxRefineV2] 'MinimaxH3LatentUpscaler3D' isn't registered — install "
                             "Comfyui_Minimax_h3_latent_Upscaler into custom_nodes.")
 
     video_for_upscale, audio_carry = _unpack_node_result(_execute_comfy_node(
@@ -331,12 +264,24 @@ def _refine_one_chunk_beta(
     cur_h_latent, cur_w_latent = video_samples.shape[-2], video_samples.shape[-1]
     width, height = cur_w_latent * 16, cur_h_latent * 16
 
-    log.info("[MuseMinimaxRefineV14] %s: source %dx%d, seed=%d, steps=%d (first-pass=%d), keyframes=%s",
+    log.info("[MuseMinimaxRefineV2] %s: source %dx%d, seed=%d, steps=%d (first-pass=%d), keyframes=%s",
               log_label, width, height, seed, steps, two_stage_first_pass_steps,
               "first+last" if (first_frame is not None and last_frame is not None)
               else "first" if first_frame is not None else "last" if last_frame is not None else "none")
 
     sampler = _unpack_node_result(_execute_comfy_node(KSamplerSelect, sampler_name=sampler_name))[0]
+
+    # Free the main DiT before the text encoder loads for this chunk's own prompt —
+    # same reasoning as the unload before the upscaler below, mirrored for the
+    # handoff into THIS chunk. On a multi-chunk candidate, the previous chunk's
+    # model is still resident here with nothing having cleared it, and the text
+    # encoder call below only needs clip/vae, not the model.
+    try:
+        import comfy.model_management as _mm
+        _mm.unload_all_models()
+    except Exception:
+        log.warning("[MuseMinimaxRefineV2] %s: could not unload before text "
+                    "encoding — continuing anyway.", log_label)
 
     if ref_images_dict or ref_audios_dict:
         positive = _unpack_node_result(_execute_comfy_node(
@@ -346,6 +291,24 @@ def _refine_one_chunk_beta(
         ))[0]
     else:
         positive = _unpack_node_result(_execute_comfy_node(CLIPTextEncode, clip=clip, text=chunk_prompt))[0]
+
+    # Free the main DiT before the upscaler loads its own weights. The upscaler
+    # (MinimaxH3LatentUpscaler3D) never asks ComfyUI to make room for itself — it
+    # just does a raw model.to(device) and hopes there's free VRAM sitting around.
+    # Confirmed 2026-09-04: a generously-reserved main model (H3AutoReserve's
+    # "roomy" branch, or simply a small GGUF model that fits with headroom to
+    # spare) stays fully resident with nothing forcing it out, so the upscaler's
+    # own load can OOM even on a card with plenty of total VRAM. Unloading here
+    # is safe — BasicGuider below is the next thing that actually touches `model`,
+    # and ComfyUI reloads it automatically the moment that call needs it, by
+    # which point the upscaler has already unloaded itself (force_unload=True,
+    # already the default below) and is out of the way.
+    try:
+        import comfy.model_management as _mm
+        _mm.unload_all_models()
+    except Exception:
+        log.warning("[MuseMinimaxRefineV2] %s: could not unload the main model "
+                    "before the Stage-2 upscaler — continuing anyway.", log_label)
 
     # MinimaxH3LatentUpscaler3D — the actual swap. Same call shape as the Beta
     # Director's own two-stage upscale step (force_unload=True, fp16, CUDA), so the
@@ -369,15 +332,18 @@ def _refine_one_chunk_beta(
 
     # Keyframe lock — resize/re-encode the ORIGINAL keyframe images fresh at THIS
     # pass's own (upscaled) resolution, matching Director's own Stage 2 fix.
-    positive = _rebuild_keyframe_conditioning(positive, vae, first_frame, last_frame, tgt_w * 16, tgt_h * 16, frame_count, guide_frames)
+    positive = _rebuild_keyframe_conditioning(positive, vae, first_frame, last_frame, tgt_w * 16, tgt_h * 16, frame_count)
 
-    # minimax_refs (reference images) get the same Stage-2 resolution treatment —
-    # see _rebuild_refs_conditioning_for_stage2's own docstring for why this
-    # matters. ref_images_dict here is the same dict that built `positive` above,
-    # so this is a fresh re-encode in the normal case, not a fallback.
-    positive = _rebuild_refs_conditioning_for_stage2(
-        positive, vae, tgt_w, tgt_h, ref_image_size, ref_images_dict, log_label=log_label,
-    )
+    # Free the text encoder (still resident from earlier in this function) before
+    # the DiT needs to reload for sampling. The upscaler above already unloads
+    # itself (force_unload=True), so this is specifically clearing the text
+    # encoder's own room, not re-doing the upscaler's own unload.
+    try:
+        import comfy.model_management as _mm
+        _mm.unload_all_models()
+    except Exception:
+        log.warning("[MuseMinimaxRefineV2] %s: could not unload before sampling "
+                    "— continuing anyway.", log_label)
 
     guider = _unpack_node_result(_execute_comfy_node(BasicGuider, model=model, conditioning=positive))[0]
     full_sigmas = _unpack_node_result(_execute_comfy_node(
@@ -392,7 +358,7 @@ def _refine_one_chunk_beta(
     upscaled_video["samples"] = upscaled_samples
     upscaled_video["noise_mask"] = torch.ones_like(upscaled_samples)
     log.info(
-        "[MuseMinimaxRefineV14] %s upscale (MinimaxH3LatentUpscaler3D): latent %dx%d -> %dx%d "
+        "[MuseMinimaxRefineV2] %s upscale (MinimaxH3LatentUpscaler3D): latent %dx%d -> %dx%d "
         "(requested %.2f MP, effective %.3fx/%.3fx)",
         log_label, cur_w_latent, cur_h_latent, tgt_w, tgt_h, float(two_stage_target_megapixels), eff_x, eff_y,
     )
@@ -421,7 +387,7 @@ def _refine_one_chunk_beta(
         # fed the raw latent instead of a lossy pixel re-encode — see this node's own
         # module docstring for why this replaces (not layers onto) Auto-Chain.
         if MiniMaxH3GeneratedAVMaskedContext is None:
-            log.warning("[MuseMinimaxRefineV14] %s: raw_latent_carry_test is on but "
+            log.warning("[MuseMinimaxRefineV2] %s: raw_latent_carry_test is on but "
                         "'MiniMaxH3GeneratedAVMaskedContext' isn't registered — no continuity carry applied. "
                         "Install ComfyUI-H3-Motion-Context-MultiRef into custom_nodes.", log_label)
         else:
@@ -431,7 +397,7 @@ def _refine_one_chunk_beta(
                 context_length=int(carry_length), audio_feather_ticks=8,
             ))[:2]
             carry_trim_frames = int(carry_trim_frames_out)
-            log.info("[MuseMinimaxRefineV14] %s raw-latent carry: requested %d frames, trim=%d frames",
+            log.info("[MuseMinimaxRefineV2] %s raw-latent carry: requested %d frames, trim=%d frames",
                       log_label, int(carry_length), carry_trim_frames)
     elif carry_images is not None and carry_images.shape[0] > 0 and MiniMaxH3GeneratedAVMaskedContext is not None:
         # Fallback — V1.3's original always-on pixel-VAE carry, unchanged. Used
@@ -459,11 +425,11 @@ def _refine_one_chunk_beta(
             context_length=carry_n, audio_feather_ticks=8,
         ))[:2]
         carry_trim_frames = int(carry_trim_frames_out)
-        log.info("[MuseMinimaxRefineV14] %s pixel-VAE carry (raw_latent_carry_test off): %d frames "
+        log.info("[MuseMinimaxRefineV2] %s pixel-VAE carry (raw_latent_carry_test off): %d frames "
                   "re-encoded from the previous refined chunk, trim=%d frames",
                   log_label, carry_n, carry_trim_frames)
     elif carry_images is not None and MiniMaxH3GeneratedAVMaskedContext is None:
-        log.warning("[MuseMinimaxRefineV14] %s: no continuity carry applied — the 'H3 Generated AV Masked "
+        log.warning("[MuseMinimaxRefineV2] %s: no continuity carry applied — the 'H3 Generated AV Masked "
                     "Context' custom node (ComfyUI-H3-Motion-Context-MultiRef) isn't installed. This chunk's "
                     "seam may not match the rest of the video.", log_label)
 
@@ -488,7 +454,7 @@ def _refine_one_chunk_beta(
     return refined_images, refined_audio, sampled
 
 
-class MuseMinimaxRefineV14:
+class MuseMinimaxRefineV2:
     """Finishes a Seed Hunt candidate scouted by MuseMinimaxDirectorV1_2TwoStageBeta
     (two_stage_seed_hunt_latent_only=True) at full resolution, using the SAME upscale
     method (MinimaxH3LatentUpscaler3D) and the SAME stronger continuity mechanism
@@ -520,38 +486,22 @@ class MuseMinimaxRefineV14:
                     "Only used when ref_images is connected. 'match' scales references down to the output's "
                     "pixel area (faster). 'max' keeps up to a 2048px short edge for stronger identity "
                     "fidelity, but reference tokens ride every sampling step so it's several times slower."}),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "tooltip":
-                    "For a real Seed Hunt candidate, this is only a fallback — the actual seed it was "
-                    "scouted with travels embedded in the candidate latent itself (_muse_seed_used) and is "
-                    "used automatically, so this widget's value is ignored whenever that's present. It only "
-                    "matters if the embedded value is missing (an older/incompatible latent, or ComfyUI's "
-                    "own temp folder was cleared) — in that case, set it to match the seed the chosen "
-                    "candidate was actually generated with."}),
-                "steps": ("INT", {"default": 8, "min": 1, "max": 100, "tooltip":
-                    "Must match the TOTAL steps the candidate's own Stage 1 was generated with — unlike "
-                    "seed and First-Pass Steps, this one is NOT embedded in the candidate latent, so it "
-                    "always needs to be set by hand."}),
-                "two_stage_first_pass_steps": ("INT", {"default": 2, "min": 1, "max": 50, "step": 1, "tooltip":
-                    "For a real Seed Hunt candidate, this is only a fallback — the actual First-Pass Steps "
-                    "value it was scouted with travels embedded in the candidate latent itself "
-                    "(_muse_first_pass_steps_used) and is used automatically, so this widget's value is "
-                    "ignored whenever that's present. It only matters if the embedded value is missing (an "
-                    "older/incompatible latent, or ComfyUI's own temp folder was cleared) — in that case, "
-                    "set it to match the First-Pass Steps the candidate's own Stage 1 actually used. Cap "
-                    "raised from 6 to 50 (2026-09-02) to match the Director's own widget."}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff,
+                    "tooltip": "Must match the seed the chosen candidate was actually generated with."}),
+                "steps": ("INT", {"default": 8, "min": 1, "max": 100,
+                    "tooltip": "Must match the TOTAL steps the candidate's own Stage 1 was generated with."}),
+                "two_stage_first_pass_steps": ("INT", {"default": 2, "min": 1, "max": 6, "step": 1,
+                    "tooltip": "Must match the First-Pass Steps the candidate's own Stage 1 used."}),
                 "sampler_name": (list(comfy.samplers.KSampler.SAMPLERS), {"default": "euler"}),
-                "scheduler": (list(dict.fromkeys(
-                    ["simple", "normal", "beta", "sgm_uniform"]
-                    + list(comfy.samplers.KSampler.SCHEDULERS)
-                )), {"default": "beta"}),
+                "scheduler": (["simple", "normal", "beta", "sgm_uniform"], {"default": "beta"}),
                 "two_stage_latent_upscale_model": (_scan_latent_upscale_models(), {"tooltip":
                     "Which trained latent-upscale checkpoint to use (from "
                     "ComfyUI/models/latent_upscale_models/) — same model family the Beta Director's own "
                     "two-stage upscale uses. Real learned network, not interpolation."}),
-                "two_stage_target_megapixels": ("FLOAT", {"default": 1.0, "min": 0.2, "max": 2.0, "step": 0.01, "tooltip":
-                    "Target resolution for the upscale, in megapixels — matches the upscaler node's own "
-                    "'megapixels' sizing mode (aspect ratio preserved, pixel-aligned to 32)."}),
-                "raw_latent_carry_test": ("BOOLEAN", {"default": False, "tooltip":
+                "two_stage_target_megapixels": ("FLOAT", {"default": 1.0, "min": 0.2, "max": 2.0, "step": 0.1,
+                    "tooltip": "Target resolution for the upscale, in megapixels — matches the upscaler node's "
+                               "own 'megapixels' sizing mode (aspect ratio preserved, pixel-aligned to 32)."}),
+                "raw_latent_carry_test": ("BOOLEAN", {"default": True, "tooltip":
                     "For multi-chunk candidates only. Genuinely freezes each continuation chunk's own opening "
                     "latent using the PREVIOUS refined chunk's raw final sampled latent (no VAE round trip) — "
                     "the same mechanism the Beta Director's own raw_latent_carry_test uses, confirmed via a "
@@ -602,23 +552,45 @@ class MuseMinimaxRefineV14:
             3: candidate_3_latent, 4: candidate_4_latent,
         }
         if candidate == 0:
-            log.warning("[MuseMinimaxRefineV14] No candidate selected (candidate=0) — click one of the four "
+            log.warning("[MuseMinimaxRefineV2] No candidate selected (candidate=0) — click one of the four "
                         "buttons in the node's UI to pick which candidate to continue. Blocking, not running.")
             blocker = ExecutionBlocker(None)
             return (blocker, blocker)
         chosen_latent = candidates.get(candidate)
         not_generated = isinstance(chosen_latent, dict) and chosen_latent.get("_muse_candidate_not_generated")
         if chosen_latent is None or not_generated:
-            log.warning("[MuseMinimaxRefineV14] Candidate slot %d has no latent connected — wire "
+            log.warning("[MuseMinimaxRefineV2] Candidate slot %d has no latent connected — wire "
                         "candidate_%d_latent, or pick a filled slot. Blocking, not running.",
                         candidate, candidate)
             blocker = ExecutionBlocker(None)
             return (blocker, blocker)
 
         embedded = chosen_latent if isinstance(chosen_latent, dict) else {}
-        resolved_model = embedded.get("_muse_model_used") or model
+        # Prefer the disk-backed checkpoint name over an embedded live model object —
+        # see the Director's own note on _muse_model_checkpoint_name for why: a live
+        # model riding in the candidate is exactly what ComfyUI's cache discards first,
+        # forcing a full re-scout the moment a candidate gets picked. Reload from the
+        # checkpoint name here instead, the same way everything else about a candidate
+        # already comes from disk. _muse_model_used stays as a fallback for candidates
+        # that couldn't determine a checkpoint name (or were scouted before this fix).
+        resolved_model = None
+        _checkpoint_name = embedded.get("_muse_model_checkpoint_name")
+        if _checkpoint_name:
+            from nodes import NODE_CLASS_MAPPINGS as _NCM
+            H3ModelLoaderAny = _NCM.get("H3ModelLoaderAny")
+            if H3ModelLoaderAny is not None:
+                resolved_model = _unpack_node_result(_execute_comfy_node(
+                    H3ModelLoaderAny, model_name=_checkpoint_name,
+                ))[0]
+            else:
+                log.warning("[MuseMinimaxRefineV2] Candidate %d's checkpoint (%s) couldn't be "
+                            "reloaded — 'H3ModelLoaderAny' isn't registered (install "
+                            "ComfyUI-H3-Multishot into custom_nodes). Falling back to the "
+                            "connected model input.", candidate, _checkpoint_name)
         if resolved_model is None:
-            log.warning("[MuseMinimaxRefineV14] No model connected, and candidate %d has none embedded either "
+            resolved_model = embedded.get("_muse_model_used") or model
+        if resolved_model is None:
+            log.warning("[MuseMinimaxRefineV2] No model connected, and candidate %d has none embedded either "
                         "— wire the correct checkpoint into 'model' manually. Blocking, not running.", candidate)
             blocker = ExecutionBlocker(None)
             return (blocker, blocker)
@@ -627,7 +599,7 @@ class MuseMinimaxRefineV14:
         if ref_images is not None and ref_images.shape[0] > 0:
             ref_images_dict = {f"ref_image_{i}": ref_images[i:i + 1] for i in range(ref_images.shape[0])}
         else:
-            log.warning("[MuseMinimaxRefineV14] No ref_images connected — continuing from text/keyframes only. "
+            log.warning("[MuseMinimaxRefineV2] No ref_images connected — continuing from text/keyframes only. "
                         "Wire in the same reference photos the candidate used.")
 
         ref_audios_dict = None
@@ -635,12 +607,12 @@ class MuseMinimaxRefineV14:
         if _ref_audio_slots:
             ref_audios_dict = {f"ref_audio_{i}": a for i, a in enumerate(_ref_audio_slots)}
         elif ref_images_dict:
-            log.warning("[MuseMinimaxRefineV14] No ref_audio connected — if the original candidate used voice "
+            log.warning("[MuseMinimaxRefineV2] No ref_audio connected — if the original candidate used voice "
                         "cloning, this refine pass has nothing telling it what voice to keep.")
 
         bundle = chosen_latent.get("_muse_scout_bundle") if isinstance(chosen_latent, dict) else None
         if not bundle:
-            log.warning("[MuseMinimaxRefineV14] Candidate %d has no saved chunk bundle — this node only "
+            log.warning("[MuseMinimaxRefineV2] Candidate %d has no saved chunk bundle — this node only "
                         "finishes Latent-Only Seed Hunt candidates (two_stage_seed_hunt_latent_only=True on "
                         "the Beta Director). Blocking, not running.", candidate)
             blocker = ExecutionBlocker(None)
@@ -650,7 +622,7 @@ class MuseMinimaxRefineV14:
         chunk_count = int(bundle.get("chunk_count") or 0)
         carry_length = int(bundle.get("carry_length") or 39)
         if not bundle_dir or not os.path.isdir(bundle_dir) or chunk_count < 1:
-            log.warning("[MuseMinimaxRefineV14] Candidate %d's saved chunk bundle is missing or empty (%s) — "
+            log.warning("[MuseMinimaxRefineV2] Candidate %d's saved chunk bundle is missing or empty (%s) — "
                         "it may already have been cleaned up by an earlier Refine run on this candidate, or "
                         "ComfyUI's own temp folder was cleared. Re-run Seed Hunt scouting to generate a fresh "
                         "one. Blocking, not running.", candidate, bundle_dir)
@@ -666,7 +638,7 @@ class MuseMinimaxRefineV14:
         for chunk_idx in range(chunk_count):
             chunk_path = os.path.join(bundle_dir, f"chunk_{chunk_idx + 1:04d}.pt")
             if not os.path.isfile(chunk_path):
-                log.warning("[MuseMinimaxRefineV14] Chunk %d/%d is missing from candidate %d's saved bundle "
+                log.warning("[MuseMinimaxRefineV2] Chunk %d/%d is missing from candidate %d's saved bundle "
                             "(%s) — stopping here rather than silently returning a partial video.",
                             chunk_idx + 1, chunk_count, candidate, chunk_path)
                 blocker = ExecutionBlocker(None)
@@ -693,12 +665,7 @@ class MuseMinimaxRefineV14:
             )
             chunk_last = last_frame if last_frame is not None else saved.get("last_frame")
             chunk_frame_count = saved.get("frame_count")
-            chunk_guides = saved.get("guide_frames") or []
-            chunk_ref_images = saved.get("ref_images") or ref_images_dict
-            # Sequential rebuild currently applies to pure First/Last-Frame chunks.
-            # Hybrid/reference chunks retain their saved multimodal Stage-1 conditioning.
-            if (chunk_idx > 0 and carry_images is not None and chunk_first is not None
-                    and not chunk_guides and not chunk_ref_images):
+            if chunk_idx > 0 and carry_images is not None and chunk_first is not None:
                 saved_latent = _rebuild_stage1_continuation(
                     resolved_model, clip, vae, audio_vae, saved["prompt"], saved_latent,
                     chunk_first, chunk_last, chunk_frame_count, resolved_seed, steps,
@@ -709,9 +676,9 @@ class MuseMinimaxRefineV14:
                 resolved_model, clip, vae, audio_vae, saved["prompt"], saved_latent,
                 ref_image_size, resolved_seed, steps, resolved_first_pass_steps,
                 sampler_name, scheduler, two_stage_latent_upscale_model, two_stage_target_megapixels,
-                chunk_ref_images, ref_audios_dict, chunk_first, chunk_last, chunk_frame_count, chunk_guides,
+                ref_images_dict, ref_audios_dict, chunk_first, chunk_last, chunk_frame_count,
                 carry_images, carry_audio, carry_length,
-                False, carry_context_latent,  # V1.2B-matched pixel/VAE carry; legacy raw toggle ignored.
+                raw_latent_carry_test, carry_context_latent,
                 log_label=f"candidate={candidate} chunk={chunk_idx + 1}/{chunk_count}",
             )
             all_images.append(chunk_images)
@@ -727,5 +694,5 @@ class MuseMinimaxRefineV14:
         return (images, audio)
 
 
-NODE_CLASS_MAPPINGS = {"MuseMinimaxRefineV14": MuseMinimaxRefineV14}
-NODE_DISPLAY_NAME_MAPPINGS = {"MuseMinimaxRefineV14": "Muse Minimax Refine V1.4 (Beta-matched)"}
+NODE_CLASS_MAPPINGS = {"MuseMinimaxRefineV2": MuseMinimaxRefineV2}
+NODE_DISPLAY_NAME_MAPPINGS = {"MuseMinimaxRefineV2": "Muse Minimax Refine V2 (Beta-matched)"}

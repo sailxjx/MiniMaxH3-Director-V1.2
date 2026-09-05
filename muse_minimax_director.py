@@ -3100,6 +3100,26 @@ class MuseMinimaxDirector:
                           chunk_idx + 1, num_chunks, pass_seed, chunk_length, prev_chunk_images is not None,
                           prev_chunk_audio is not None, use_hybrid_chunk)
 
+                # Free the main DiT before the text encoder loads for this chunk's own
+                # prompt. Confirmed 2026-09-04 from a live run's own log: the text
+                # encoder (~16 GB) requests to load WHILE the previous chunk's DiT is
+                # still fully resident — even on chunk 1, where nothing should be
+                # competing yet — and only ComfyUI's own reactive eviction (not
+                # anything in this code) sorts it out, after a VRAM spike that on a
+                # tight card spills into slow shared/system memory (2-12x measured).
+                # Unloading here is safe: the text-encode call below only needs
+                # clip/vae, not the model, and ComfyUI reloads the model on its own
+                # the moment it's actually needed again (BasicGuider, below). Safe to
+                # touch the model here too — this no longer rides live inside any
+                # cached candidate output (see _muse_model_checkpoint_name), so there's
+                # nothing fragile left for this to disturb across queues.
+                try:
+                    import comfy.model_management as _mm
+                    _mm.unload_all_models()
+                except Exception:
+                    log.warning("[MuseMinimaxDirector] chunk %d: could not unload before "
+                                "text encoding — continuing anyway.", chunk_idx + 1)
+
                 if use_hybrid_chunk and chunk_guides:
                     out = _execute_comfy_node(
                         MiniMaxH3HybridRefAndKeyframe,
@@ -3318,6 +3338,16 @@ class MuseMinimaxDirector:
                 # across shots is the standard fix for texture/exposure consistency in a
                 # stitched multi-shot sequence. Seed Hunt is unaffected — it already varies
                 # pass_seed itself per whole pass (see SEED_HUNT_SEED_STRIDE), not per chunk.
+                # Free the text encoder (and VAEs used by the carry/context injection
+                # above) before the DiT needs to reload for sampling — same fix as
+                # above, mirrored for the handoff back the other way.
+                try:
+                    import comfy.model_management as _mm
+                    _mm.unload_all_models()
+                except Exception:
+                    log.warning("[MuseMinimaxDirector] chunk %d: could not unload before "
+                                "sampling — continuing anyway.", chunk_idx + 1)
+
                 guider = _unpack_node_result(_execute_comfy_node(BasicGuider, model=chunk_shifted_model, conditioning=positive))[0]
                 full_sigmas = _unpack_node_result(_execute_comfy_node(
                     BasicScheduler, model=chunk_shifted_model, scheduler=scheduler, steps=steps, denoise=1.0,
@@ -3399,6 +3429,26 @@ class MuseMinimaxDirector:
 
                         video_samples = video_for_upscale["samples"]
                         cur_h_latent, cur_w_latent = video_samples.shape[-2], video_samples.shape[-1]
+
+                        # Free the main DiT before the upscaler loads its own weights — same
+                        # fix and same reasoning as MuseMinimaxRefineV14's own copy of this
+                        # call: MinimaxH3LatentUpscaler3D never asks ComfyUI to make room for
+                        # itself, it just does a raw model.to(device), so a comfortably-
+                        # resident main model with nothing forcing it out can cause the
+                        # upscaler's own load to OOM even with plenty of total VRAM on the
+                        # card. Safe to unload here — stage2_guider (built below from the
+                        # SAME `guider`/`model` this replaces) only actually touches GPU
+                        # memory once SamplerCustomAdvanced runs later, and ComfyUI reloads
+                        # the model automatically at that point, by which time the upscaler
+                        # has already unloaded itself (force_unload=True below).
+                        try:
+                            import comfy.model_management as _mm
+                            _mm.unload_all_models()
+                        except Exception:
+                            log.warning("[MuseMinimaxDirectorV1_4] chunk %d: could not unload "
+                                        "the main model before the Stage-2 upscaler — "
+                                        "continuing anyway.", chunk_idx + 1)
+
                         upscaled_result = _unpack_node_result(_execute_comfy_node(
                             MinimaxH3LatentUpscaler3D,
                             latent={"samples": video_samples},
@@ -3915,11 +3965,27 @@ class MuseMinimaxDirector:
                 last_chunk_stage1_latent["_muse_keyframe_first_frame"] = last_chunk_first
                 last_chunk_stage1_latent["_muse_keyframe_last_frame"] = last_chunk_last
                 last_chunk_stage1_latent["_muse_keyframe_frame_count"] = last_chunk_frame_count
-                # Not saved into the per-chunk scout .pt files (a MODEL object is large
-                # and identical across every chunk of one candidate anyway) — carried
-                # once here instead, on the dict Refine actually receives via
-                # candidate_N_latent regardless of whether Latent-Only Scouting is on.
-                last_chunk_stage1_latent["_muse_model_used"] = last_chunk_shifted_model
+                # Confirmed 2026-09-04: embedding the live MODEL object here (as this
+                # comment used to say) makes this candidate's cached output exactly the
+                # kind of thing ComfyUI's own cache is built to discard first — any
+                # cached result holding a live model gets evicted ahead of everything
+                # else the moment a new queue starts, which forced a full re-scout the
+                # instant a candidate was picked, even with nothing else wrong. Store
+                # just the checkpoint's filename instead — plain text, not a live
+                # object — and let Refine reload the actual model from it itself, the
+                # same way it already reads everything else for a candidate off disk.
+                # Falls back to embedding the live model (the old behaviour) only if
+                # the checkpoint name genuinely can't be determined, so a candidate
+                # still has SOMETHING to resolve a model from either way.
+                _model_checkpoint_name = None
+                try:
+                    _model_checkpoint_name = getattr(last_chunk_shifted_model.model, "h3_checkpoint_name", None)
+                except Exception:
+                    _model_checkpoint_name = None
+                if _model_checkpoint_name:
+                    last_chunk_stage1_latent["_muse_model_checkpoint_name"] = _model_checkpoint_name
+                else:
+                    last_chunk_stage1_latent["_muse_model_used"] = last_chunk_shifted_model
 
             # Latent-Only Scouting, multi-chunk timeline: last_chunk_stage1_latent is
             # only ever this pass's LAST chunk on its own — real, but incomplete, since
@@ -3976,6 +4042,72 @@ class MuseMinimaxDirector:
             for i in range(1, 4):
                 if not run_candidate[i]:
                     continue
+                # [2026-09-04] Added: sweep leftover VRAM before each extra Seed
+                # Hunt candidate. Root-caused today: H3AutoReserve's own leftover
+                # sweep only ever runs on a model's FIRST load in the session
+                # (inside _install_auto_reserve, called once by the Unified
+                # Loader) - this loop reuses that SAME already-loaded model for
+                # every extra candidate, so _install_auto_reserve never gets
+                # called again and its sweep never gets another chance to run.
+                # That's the actual reason candidate 2+ locked up under real
+                # memory pressure while candidate 1 didn't (a same-file fix was
+                # tried earlier today inside _install_auto_reserve itself, but
+                # it only ever runs once for the same reason and did not
+                # actually reach this loop - left in place, harmless, but this
+                # is the fix that matters). Runs once per candidate, not per
+                # step, so it does not reintroduce the per-step feedback loop
+                # H3AutoReserve's own pin exists to avoid.
+                # [2026-09-04, correction, same session] The manual VRAM sweep
+                # below was not enough on its own — confirmed by a real 4-candidate
+                # test: candidate 2's actual model load still only got ~13.2 GB
+                # usable, nearly identical to the broken run's ~13.5 GB. Reason:
+                # this sweep runs before several smaller VAE/text-encoder loads
+                # that happen first inside _run_pass, so most of what it clears is
+                # used up by those before the main model's own load is even
+                # reached — and H3AutoReserve's own proven sweep+reserve logic at
+                # THAT load point still never re-fires, because it only trusts its
+                # remembered (pinned) number after the first candidate. Fix: also
+                # clear that remembered number here, so H3AutoReserve's own
+                # already-working logic (the same one that gave candidate 1 its
+                # clean "cleared 19.0 GB of leftovers" load) runs fresh again for
+                # every candidate, instead of trusting a stale figure.
+                # [2026-09-04, third attempt, same session] The sys.modules name
+                # search above did not work either — confirmed by a real run:
+                # candidate 2 still loaded at ~13.6 GB usable, no "cleared X GB"
+                # line at all, meaning the search silently matched nothing (it
+                # fails quietly, not with an exception, so the earlier try/except
+                # never caught it). Guessing the module's registered name was the
+                # mistake both times. This version does not guess anything — it
+                # reaches _auto_session through the ACTUAL memory_required
+                # function already sitting on THIS run's own model object
+                # (installed by _install_auto_reserve when the Unified Loader
+                # first loaded it), via Python's own __globals__ on that function,
+                # which is guaranteed to be the real module namespace it runs
+                # against, not a name lookup that can miss.
+                try:
+                    _mr = getattr(getattr(model, "model", None), "memory_required", None)
+                    _sess = getattr(_mr, "__globals__", {}).get("_auto_session") if _mr is not None else None
+                    if isinstance(_sess, dict):
+                        _sess.clear()
+                    else:
+                        log.warning("[MuseMinimaxDirector] candidate %d: could not find "
+                                    "H3AutoReserve's remembered VRAM figure on the model "
+                                    "object — continuing anyway.", i + 1)
+                except Exception:
+                    log.warning("[MuseMinimaxDirector] candidate %d: could not reset "
+                                "H3AutoReserve's remembered VRAM figure — continuing "
+                                "anyway.", i + 1)
+                try:
+                    import comfy.model_management as _mm_candidate_sweep
+                    _dev_candidate_sweep = _mm_candidate_sweep.get_torch_device()
+                    _mm_candidate_sweep.unload_all_models()
+                    _mm_candidate_sweep.free_memory(
+                        _mm_candidate_sweep.get_total_memory(_dev_candidate_sweep) * 0.9,
+                        _dev_candidate_sweep,
+                    )
+                except Exception:
+                    log.warning("[MuseMinimaxDirector] candidate %d: leftover VRAM "
+                                "sweep failed — continuing anyway.", i + 1)
                 pass_seed = seed + i * SEED_HUNT_SEED_STRIDE
                 c_images, c_audio, _, c_latent = _run_pass(pass_seed, candidate_idx=i)
                 candidate_images[i] = c_images
@@ -4156,8 +4288,8 @@ _MUSE_MINIMAX_PROMPTGEN_SYSTEM_PROMPT = (
 )
 
 
-# Condensed from MiniMax's own official H3 prompt-example catalog (Notion doc, saved locally
-# at C:\\Users\\andyv\\Downloads\\# MiniMax H3 The Next-Gen Open-Weig.txt). Deliberately NOT the
+# Condensed from MiniMax's own official H3 prompt-example catalog (Notion doc,
+# "MiniMax H3: The Next-Gen Open-Weight Multimodal Generation Model"). Deliberately NOT the
 # full ~68KB catalog — dumping that wholesale into every call would compete with the six-section
 # format instructions above for the model's attention and inflate every request for no benefit
 # (this is exactly the class of problem that caused the earlier Gemini thinking-token truncation
