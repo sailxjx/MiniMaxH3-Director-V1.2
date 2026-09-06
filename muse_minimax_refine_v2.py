@@ -488,8 +488,14 @@ class MuseMinimaxRefineV2:
                     "fidelity, but reference tokens ride every sampling step so it's several times slower."}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff,
                     "tooltip": "Must match the seed the chosen candidate was actually generated with."}),
+                # [2026-09-06] Hidden from the panel as of this date — see the JS
+                # file's own comment. This value is no longer read; the real total is
+                # restored from the candidate's own embedded _muse_steps_used instead
+                # (falls back to this only for a pre-2026-09-06 candidate that never
+                # had that key saved on it).
                 "steps": ("INT", {"default": 8, "min": 1, "max": 100,
-                    "tooltip": "Must match the TOTAL steps the candidate's own Stage 1 was generated with."}),
+                    "tooltip": "Hidden — the real value is restored automatically from "
+                    "the chosen candidate's own Stage-1 generation."}),
                 "two_stage_first_pass_steps": ("INT", {"default": 2, "min": 1, "max": 6, "step": 1,
                     "tooltip": "Must match the First-Pass Steps the candidate's own Stage 1 used."}),
                 "sampler_name": (list(comfy.samplers.KSampler.SAMPLERS), {"default": "euler"}),
@@ -653,6 +659,19 @@ class MuseMinimaxRefineV2:
                 "_muse_first_pass_steps_used",
                 embedded.get("_muse_first_pass_steps_used", two_stage_first_pass_steps),
             ))
+            # [2026-09-06] Confirmed real bug, not a guess: this node used to rebuild
+            # the full sigma schedule from ITS OWN "steps" widget while only restoring
+            # the split POINT (resolved_first_pass_steps) from the candidate — if the
+            # widget didn't happen to match what the candidate was actually generated
+            # with, the remaining schedule this node continued the Stage-1 latent
+            # against was simply wrong. Confirmed directly to produce audible garbled
+            # audio right at the Stage-2 continuation seam (Director steps=10 vs this
+            # node's own steps=8 reproduced it twice; matching them fixed it
+            # immediately). Restoring the real total the same way seed/first-pass-steps
+            # already are makes this correct regardless of the widget's value.
+            resolved_steps = int(latent_meta.get(
+                "_muse_steps_used", embedded.get("_muse_steps_used", steps),
+            ))
             # Match the normal sequential two-stage path: once a refined predecessor
             # exists, its actual high-resolution final frame is the continuation
             # chunk's Stage-2 first-frame anchor. The scout bundle's saved first_frame
@@ -668,13 +687,13 @@ class MuseMinimaxRefineV2:
             if chunk_idx > 0 and carry_images is not None and chunk_first is not None:
                 saved_latent = _rebuild_stage1_continuation(
                     resolved_model, clip, vae, audio_vae, saved["prompt"], saved_latent,
-                    chunk_first, chunk_last, chunk_frame_count, resolved_seed, steps,
+                    chunk_first, chunk_last, chunk_frame_count, resolved_seed, resolved_steps,
                     resolved_first_pass_steps, sampler_name, scheduler,
                     carry_images, carry_audio, carry_length,
                 )
             chunk_images, chunk_audio, chunk_sampled = _refine_one_chunk_beta(
                 resolved_model, clip, vae, audio_vae, saved["prompt"], saved_latent,
-                ref_image_size, resolved_seed, steps, resolved_first_pass_steps,
+                ref_image_size, resolved_seed, resolved_steps, resolved_first_pass_steps,
                 sampler_name, scheduler, two_stage_latent_upscale_model, two_stage_target_megapixels,
                 ref_images_dict, ref_audios_dict, chunk_first, chunk_last, chunk_frame_count,
                 carry_images, carry_audio, carry_length,

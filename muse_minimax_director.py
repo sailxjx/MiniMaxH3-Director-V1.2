@@ -3416,6 +3416,19 @@ class MuseMinimaxDirector:
                         # asking the user to calculate Seed Hunt offsets or repeat the split.
                         chunk_stage1_latent["_muse_seed_used"] = int(pass_seed)
                         chunk_stage1_latent["_muse_first_pass_steps_used"] = int(split_step)
+                        # [2026-09-06] Confirmed real bug, not a guess: Refine V2 previously
+                        # only restored the split POINT (_muse_first_pass_steps_used) but
+                        # rebuilt the full sigma schedule using ITS OWN "steps" widget, not
+                        # this candidate's real total. If that widget doesn't happen to match
+                        # what this candidate was actually generated with, Refine continues
+                        # the Stage-1 latent against the wrong remaining sigma values —
+                        # confirmed directly to produce audible garbled audio right at the
+                        # Stage-2 continuation seam (e.g. Director steps=10 vs Refine
+                        # steps=8 reproduced it twice; matching them both to 10 fixed it
+                        # immediately). Embedding the real total here lets Refine always
+                        # reconstruct the exact original schedule regardless of its own
+                        # widget's value.
+                        chunk_stage1_latent["_muse_steps_used"] = int(steps)
                     else:
                         chunk_stage1_latent = None
 

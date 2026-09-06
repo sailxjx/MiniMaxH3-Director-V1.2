@@ -1208,26 +1208,32 @@ class MinimaxTimelineEditor {
     hint.textContent = "Total Duration longer than Chunk Size splits the render into multiple H3 calls, shown as separate chunk sections below — block widths within a chunk are a pacing guide only, compiled into each CUT's own \"(~Xs)\" hint.";
     this.container.appendChild(hint);
 
+    // [2026-09-06] Was a "📷 References" heading with a tiny ⚙ gear button that
+    // toggled this same settings content hidden/shown, squeezed in between the
+    // heading and the actual reference picture grid — confirmed via real user
+    // feedback nobody ever noticed the gear existed. Now its own permanently
+    // visible "⚙️ Settings" section, placed above References entirely, so
+    // References is immediately followed by its own picture grid with nothing
+    // in between, and Settings is impossible to miss.
+    this.settingsTitle = document.createElement("div");
+    this.settingsTitle.className = "mmd-section-title";
+    this.settingsTitle.style.marginTop = "4px";
+    const settingsTitleText = document.createElement("span");
+    settingsTitleText.textContent = "⚙️ Settings";
+    this.settingsTitle.appendChild(settingsTitleText);
+    this.container.appendChild(this.settingsTitle);
+
+    this.analyzeGearPanel = this._buildAnalyzeSettingsPanel();
+    this.analyzeGearPanel.style.display = "flex";
+    this.container.appendChild(this.analyzeGearPanel);
+
     this.refsTitle = document.createElement("div");
     this.refsTitle.className = "mmd-section-title";
     this.refsTitle.style.marginTop = "4px";
     const refsTitleText = document.createElement("span");
     refsTitleText.textContent = "📷 References";
     this.refsTitle.appendChild(refsTitleText);
-    const analyzeGearBtn = document.createElement("button");
-    analyzeGearBtn.className = "mmd-gear-btn";
-    analyzeGearBtn.type = "button";
-    analyzeGearBtn.title = "Timeline settings (save/load, display mode) and Analyze button settings (provider, URL, model)";
-    analyzeGearBtn.textContent = "⚙";
-    analyzeGearBtn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      this.analyzeGearPanel.style.display = this.analyzeGearPanel.style.display === "none" ? "flex" : "none";
-    });
-    this.refsTitle.appendChild(analyzeGearBtn);
     this.container.appendChild(this.refsTitle);
-
-    this.analyzeGearPanel = this._buildAnalyzeSettingsPanel();
-    this.container.appendChild(this.analyzeGearPanel);
 
     this.refsBox = document.createElement("div");
     this.refsBox.className = "mmd-box mmd-box-reference";
@@ -4685,9 +4691,11 @@ class MinimaxTimelineEditor {
   }
 
   _buildAnalyzeSettingsPanel() {
+    // [2026-09-06] Always visible now (see the constructor's own "Settings"
+    // heading, above References) — no longer toggled by a gear button, so this
+    // no longer starts hidden. display gets set to "flex" by the caller.
     const panel = document.createElement("div");
     panel.className = "mmd-gear-panel";
-    panel.style.display = "none";
     panel.addEventListener("click", (e) => e.stopPropagation());
 
     const timelineHeading = document.createElement("div");

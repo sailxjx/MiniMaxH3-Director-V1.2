@@ -6,11 +6,21 @@ const { app } = window.comfyAPI.app;
 // the node itself takes a plain "candidate" INT widget (0-4) that decides which of the
 // four wired candidate_N_latent slots actually gets refined. This file re-skins that
 // INT widget as four clickable number buttons, and hides the widgets V2 exposes as
-// backend inputs but never needs a human to touch (seed and two_stage_first_pass_steps
-// travel embedded on the candidate latent itself; timeline_data isn't used by this
-// node at all). raw_latent_carry_test is genuinely used by this node (see
-// muse_minimax_refine_v2.py) and is intentionally left visible/toggleable — it was
-// wrongly hidden here on 2026-09-04 and is fixed as of the same date.
+// backend inputs but never needs a human to touch (seed, steps and
+// two_stage_first_pass_steps all travel embedded on the candidate latent itself;
+// timeline_data isn't used by this node at all). raw_latent_carry_test is genuinely
+// used by this node (see muse_minimax_refine_v2.py) and is intentionally left
+// visible/toggleable — it was wrongly hidden here on 2026-09-04 and is fixed as of
+// the same date.
+//
+// [2026-09-06] "steps" newly hidden here: this widget's own value used to silently
+// win over the candidate's real total step count whenever it didn't happen to match
+// what the candidate was actually generated with — confirmed to produce audible
+// garbled audio right at the Stage-2 continuation seam. Now that the Python side
+// always restores and uses the candidate's real total (_muse_steps_used) instead of
+// this widget, leaving it visible/editable would only invite the exact same mismatch
+// again for no benefit — hidden the same way seed and two_stage_first_pass_steps
+// already are.
 
 function hideWidget(w) {
   if (!w) return;
@@ -39,7 +49,7 @@ function lockControlAfterGenerate(node) {
 function hideInheritedWidgets(node, nodeName) {
   if (nodeName !== "MuseMinimaxRefineV2") return;
   const inheritedOrLegacy = new Set([
-    "seed", "two_stage_first_pass_steps", "timeline_data",
+    "seed", "steps", "two_stage_first_pass_steps", "timeline_data",
   ]);
   for (const widget of node.widgets || []) {
     if (inheritedOrLegacy.has(widget.name)) hideWidget(widget);
