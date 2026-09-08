@@ -1046,7 +1046,8 @@ def _normalize_dialogue_text(text: str) -> str:
     return text
 
 
-def _wrap_dialogue(text: str, language: str, speaker_ids: list | None = None) -> str:
+def _wrap_dialogue(text: str, language: str, speaker_ids: list | None = None,
+                   subject_ids: list | None = None, audio_ids: list | None = None) -> str:
     """Wraps every "..."-quoted span in a CUT's text as <d>[Language] ...</d>,
     the guide's required dialogue/lyric tag — leaves everything outside quotes
     (including any <Subject N>/<Picture N>/<Video N>/<Audio N> tags) untouched."""
@@ -1058,7 +1059,26 @@ def _wrap_dialogue(text: str, language: str, speaker_ids: list | None = None) ->
         if speaker_ids is not None and quote_index < len(speaker_ids):
             speaker_id = speaker_ids[quote_index]
             if isinstance(speaker_id, int) and speaker_id > 0:
-                tag += f" (S{speaker_id})"
+                subject_id = subject_ids[quote_index] if subject_ids is not None and quote_index < len(subject_ids) else None
+                audio_id = audio_ids[quote_index] if audio_ids is not None and quote_index < len(audio_ids) else None
+                if isinstance(subject_id, int) and subject_id > 0:
+                    # Sentence-level speaker controls must bind the visible subject
+                    # to its global speaker ID BEFORE the dialogue. Appending only
+                    # `(Sx)` after `</d>` left H3 free to guess which on-screen
+                    # person owned the voice reference, especially with two similar
+                    # characters. This follows the official Ref2VA structure:
+                    # `<Subject N> (Sx) ... <d>dialogue</d>`
+                    if isinstance(audio_id, int) and audio_id > 0:
+                        tag = (
+                            f"<Subject {subject_id}> (S{speaker_id}), using the voice timbre "
+                            f"and measured delivery from <Audio {audio_id}>: {tag}"
+                        )
+                    else:
+                        tag = f"<Subject {subject_id}> (S{speaker_id}): {tag}"
+                else:
+                    # First/Last Frame mode has no Subject abstraction, so preserve
+                    # its existing event-order speaker marker.
+                    tag += f" (S{speaker_id})"
         quote_index += 1
         return tag
     return _DIALOGUE_RE.sub(_sub, text)
@@ -2702,6 +2722,7 @@ class MuseMinimaxDirector:
                         video_slot += 1
 
                     chunk_ref_audios = {}
+                    voice_audio_tag_by_subject = {}
                     audio_slot = 0
                     carry_audio_tag = None
                     # A fully_copy clip is, by MiniMax's definition, this chunk's
@@ -2742,6 +2763,8 @@ class MuseMinimaxDirector:
                         # ("<Audio N> is the voice-timbre reference for <Subject M> (Sx)")
                         # instead of a generic, unlinked description.
                         paired_subj_n = subject_number_by_char_index.get(ui_idx)
+                        if a_retention == "reference" and paired_subj_n is not None:
+                            voice_audio_tag_by_subject[paired_subj_n] = audio_tag_counter
                         if a_retention == "fully_copy" and paired_subj_n is not None:
                             sx = speaker_assign.get(paired_subj_n)
                             sx_suffix = f" (S{sx})" if sx else ""
@@ -2799,7 +2822,8 @@ class MuseMinimaxDirector:
                                 )
                             else:  # reference
                                 chunk_audio_retention_lines.append(
-                                    f"<Audio {audio_tag_counter}>: reference - guides dialogue delivery "
+                                    f"<Audio {audio_tag_counter}>: reference - the target speaker follows "
+                                    f"<Audio {audio_tag_counter}>'s voice timbre and measured delivery "
                                     "without copying the original signal."
                                 )
                         task_flags.add("audio reuse" if a_retention in ("fully_copy", "partially_copy") else "audio reference")
@@ -2926,6 +2950,12 @@ class MuseMinimaxDirector:
                             task_bits.append(t)
                     summary_line = f"[{' + '.join(task_bits)}] " + _build_summary_sentence(
                         chunk_subject_tags, video_continuity_tag, carry_audio_tag)
+                    if voice_audio_tag_by_subject:
+                        voice_links = [
+                            f"<Audio {audio_n}> as the voice-timbre reference for <Subject {subject_n}>"
+                            for subject_n, audio_n in voice_audio_tag_by_subject.items()
+                        ]
+                        summary_line += " The dialogue uses " + ", and ".join(voice_links) + "."
 
                     shot_lines = []
                     shot_idx = 0
@@ -2980,10 +3010,16 @@ class MuseMinimaxDirector:
                                     text = f"<Subject {subj_n}> (S{s_n}) continues: {text}"
                         if line_speakers is not None:
                             speaker_ids = []
+                            dialogue_subject_ids = []
+                            dialogue_audio_ids = []
                             for char_idx in line_speakers:
                                 subj_n = subject_number_by_char_index.get(char_idx) if isinstance(char_idx, int) else None
+                                dialogue_subject_ids.append(subj_n)
+                                dialogue_audio_ids.append(voice_audio_tag_by_subject.get(subj_n))
                                 speaker_ids.append(speaker_assign.get(subj_n) if subj_n is not None else None)
-                            text = _wrap_dialogue(text, dialogue_language, speaker_ids)
+                            text = _wrap_dialogue(
+                                text, dialogue_language, speaker_ids,
+                                dialogue_subject_ids, dialogue_audio_ids)
                         else:
                             text = _wrap_dialogue(text, dialogue_language)
                         if shot_idx == 1:

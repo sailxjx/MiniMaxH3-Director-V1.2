@@ -1,5 +1,30 @@
 # Claude Changes Log — Muse Minimax Director V1.4 / Refine V2
 
+## 2026-09-08 00:39 BST — Fixed: sentence-level speaker controls weakly attached voice references after dialogue
+
+**Reproduction:** two visible female character references, two distinct Voice Reference
+audio clips, and one sentence assigned to each character compiled correct Audio-to-Subject
+definitions, but the rendered voices crossed or ignored the supplied timbre. Replacing one
+clip with an unmistakable male voice produced two female voices, ruling out a simple audio
+tensor swap and showing that H3 was falling back to visual voice priors.
+
+**Root cause:** the newer per-sentence `dialogueSpeakers` path compiled dialogue as
+`<d>[Language] ...</d> (Sx)`. The official Ref2VA structure binds the visible subject and
+global speaker before the vocal event: `<Subject N> (Sx) ... <d>...</d>`. The older
+whole-CUT speaker path already did this; only the sentence-level path was malformed.
+
+**Fix:** `_wrap_dialogue` now optionally accepts corresponding Subject IDs. In
+Reference/Hybrid sentence-level compilation it emits
+`<Subject N> (Sx): <d>[Language] ...</d>` for every assigned quoted sentence. First/Last
+Frame mode has no Subject abstraction and retains its existing event-order `(Sx)` form.
+Audio loading, dictionary order, retention modes, and Audio-to-Subject definitions were
+not changed; inspection confirmed those were already ordered correctly.
+
+**Verification:** Python syntax compilation plus focused dialogue-wrapper checks cover two
+separate subjects, per-sentence attribution, and the unchanged no-Subject fallback. A full
+render should be repeated with the same two-character/two-voice test after restarting
+ComfyUI so the updated module is loaded.
+
 ## 2026-09-06 — Fixed: Refine V2 could continue a Seed Hunt candidate against the wrong sigma schedule, producing garbled audio at the Stage-2 seam
 
 **Root cause, confirmed via a real reproducible test, not a guess:** `MuseMinimaxRefineV2`
@@ -67,3 +92,35 @@ already-saved workflow the moment someone updates and reopens the node, nothing 
 to be rebuilt.
 
 Files touched: `js/muse_minimax_director.js`.
+
+
+## 2026-09-08 01:26 BST  Aligned the complete Voice Reference prompt chain with MiniMax official Ref2VA guidance
+
+The remaining generated Voice Reference prose was audited against the official Ref2VA
+guide. The compiler now uses the official retention meaning: the target speaker follows
+each Audio reference's voice timbre and measured delivery without copying the original
+signal. It also names every Audio-to-Subject voice relationship in the summary and cites
+the matching Audio reference at the actual spoken event, producing an explicit chain from
+Subject N to Sx to Audio N to dialogue.
+
+Only standalone Ref Audio with Voice Reference retention receives this voice-timbre chain.
+Fully copied lip-sync/song audio, partial and weak audio modes, carry audio, First/Last
+Frame fallback behavior, and physical reference-audio ordering remain unchanged.
+
+Verification: Python syntax compilation, git diff validation, and focused source checks
+passed. A restarted ComfyUI render is still required for perceptual confirmation because
+Ref2VA voice adherence is generative rather than deterministic.
+
+
+## 2026-09-08 01:36 BST  Removed duplicated speech verb from Voice Reference vocal events
+
+The first official-format pass inserted an automatic says before each dialogue even
+though the user's CUT prose commonly already says says, replies, asks, or another speech
+verb. This produced repetitive text such as says, Subject 1 ... says:.
+
+The generated binding now ends after the matching Audio reference with a colon:
+Subject N (Sx), using the voice timbre and measured delivery from Audio N: dialogue.
+The user's own speech verb remains untouched. Subject, speaker, Audio, language, dialogue,
+retention, and summary mappings are otherwise unchanged.
+
+Verification: exact single replacement, Python syntax compilation, and git diff check.
