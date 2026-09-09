@@ -1,5 +1,8 @@
 # Muse Minimax Director V1.4
 
+Fork additions: [persistent Stage1 bundles, native suffix resume and per-group Refine audio control](docs/native-continuation.md).
+See that guide for API inputs, dependency requirements, compatibility changes and tests.
+
 **Timeline-based director node for MiniMax H3 in ComfyUI, with Seed Hunt scouting, two-stage sampling, and hard-frozen chunk-boundary continuity**
 
 Built by [Muse Collective](https://musecollective.co.uk) — write a single flowing script broken into CUTs, drop in reference character images/video/audio, and let the node handle chunking, prompt-per-chunk splitting, and reference-tag numbering for you.

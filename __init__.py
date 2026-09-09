@@ -11,6 +11,10 @@ from .muse_minimax_refine_v2 import (
     NODE_CLASS_MAPPINGS as _REFINE_V2_NODE_CLASS_MAPPINGS,
     NODE_DISPLAY_NAME_MAPPINGS as _REFINE_V2_NODE_DISPLAY_NAME_MAPPINGS,
 )
+from .muse_stage1_bundle_loader import (
+    NODE_CLASS_MAPPINGS as _BUNDLE_NODE_CLASS_MAPPINGS,
+    NODE_DISPLAY_NAME_MAPPINGS as _BUNDLE_NODE_DISPLAY_NAME_MAPPINGS,
+)
 
 # [2026-09-05] Refine V2 (Beta-matched) is the one supported Refine node in
 # this repo going forward. Plain Refine, Refine V14 and Muse Model Route have
@@ -20,10 +24,12 @@ from .muse_minimax_refine_v2 import (
 NODE_CLASS_MAPPINGS = {
     **_DIRECTOR_NODE_CLASS_MAPPINGS,
     **_REFINE_V2_NODE_CLASS_MAPPINGS,
+    **_BUNDLE_NODE_CLASS_MAPPINGS,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     **_DIRECTOR_NODE_DISPLAY_NAME_MAPPINGS,
     **_REFINE_V2_NODE_DISPLAY_NAME_MAPPINGS,
+    **_BUNDLE_NODE_DISPLAY_NAME_MAPPINGS,
 }
 
 WEB_DIRECTORY = "./js"

@@ -224,7 +224,7 @@ def _refine_one_chunk_beta(
     ref_images_dict, ref_audios_dict, first_frame, last_frame, frame_count,
     carry_images, carry_audio, carry_length,
     raw_latent_carry_test, carry_context_latent,
-    log_label,
+    log_label, disable_previous_audio=False, checkpoint_directory="", checkpoint_index=0,
 ):
     """Same overall shape as V1.3's own _refine_one_chunk (upscale, priming pass,
     recombine, final DisableNoise pass, decode, trim) — two things changed to match
@@ -379,7 +379,15 @@ def _refine_one_chunk_beta(
     ))[0]
 
     carry_trim_frames = 0
-    if raw_latent_carry_test and carry_context_latent is not None:
+    if disable_previous_audio:
+        if carry_context_latent is None or MiniMaxH3GeneratedAVMaskedContext is None:
+            raise ValueError("Video-only Refine context unavailable")
+        from .muse_refine_audio_control import inject_video_only
+        recombined, carry_trim_frames = inject_video_only(
+            recombined, carry_context_latent, carry_length, MiniMaxH3GeneratedAVMaskedContext)
+        log.info("[MuseMinimaxRefineV2] %s previous audio disabled; video-only carry trim=%d",
+                 log_label, carry_trim_frames)
+    elif raw_latent_carry_test and carry_context_latent is not None:
         # Genuinely freezes recombined's own opening latent using the PREVIOUS
         # refined chunk's own raw final sampled latent (carry_context_latent — this
         # refine pass's own equivalent of Director Beta's prev_chunk_final_context_latent),
@@ -439,6 +447,11 @@ def _refine_one_chunk_beta(
         sigmas=low_sigmas, latent_image=recombined,
     ))[0]
 
+    from .muse_refine_audio_control import save_sampled
+    save_sampled(sampled, checkpoint_directory, checkpoint_index,
+        {"seed": seed, "steps": steps, "first_pass_steps": two_stage_first_pass_steps,
+         "sampler": sampler_name, "scheduler": scheduler, "carry_trim_frames": carry_trim_frames,
+         "disable_previous_audio": disable_previous_audio, "group": log_label})
     refined_images = _unpack_node_result(_execute_comfy_node(VAEDecode, samples=sampled, vae=vae))[0]
     refined_audio = _unpack_node_result(_execute_comfy_node(VAEDecodeAudio, samples=sampled, vae=audio_vae))[0]
 
@@ -496,8 +509,9 @@ class MuseMinimaxRefineV2:
                 "steps": ("INT", {"default": 8, "min": 1, "max": 100,
                     "tooltip": "Hidden — the real value is restored automatically from "
                     "the chosen candidate's own Stage-1 generation."}),
-                "two_stage_first_pass_steps": ("INT", {"default": 2, "min": 1, "max": 6, "step": 1,
-                    "tooltip": "Must match the First-Pass Steps the candidate's own Stage 1 used."}),
+                "two_stage_first_pass_steps": ("INT", {"default": 2, "min": 1, "max": 50, "step": 1,
+                    "tooltip": "Must match the First-Pass Steps the candidate's own Stage 1 used. The value is "
+                               "clamped by the sampler to steps minus one."}),
                 "sampler_name": (list(comfy.samplers.KSampler.SAMPLERS), {"default": "euler"}),
                 "scheduler": (["simple", "normal", "beta", "sgm_uniform"], {"default": "beta"}),
                 "two_stage_latent_upscale_model": (_scan_latent_upscale_models(), {"tooltip":
@@ -518,6 +532,12 @@ class MuseMinimaxRefineV2:
                 "timeline_data": ("STRING", {"default": "{}", "multiline": False}),
             },
             "optional": {
+                "preserve_stage1_latents": ("BOOLEAN", {"default": False, "tooltip":
+                    "When true, retain each persisted Stage-1 chunk and skip continuation Stage-1 rebuilding."}),
+                "group_audio_slots": ("STRING", {"default": "", "multiline": True,
+                    "tooltip": "JSON slot lists per saved group; empty string retains global voice routing."}),
+                "refine_latent_directory": ("STRING", {"default": "",
+                    "tooltip": "Unique job-owned output-relative directory for sampled AV checkpoints."}),
                 "model": ("MODEL", {"tooltip":
                     "Leave unconnected to auto-use the model the Beta Director embedded on the chosen "
                     "candidate (_muse_model_used)."}),
@@ -528,6 +548,9 @@ class MuseMinimaxRefineV2:
                 "ref_images": ("IMAGE", {"tooltip":
                     "The same reference photos the original candidate used — without these, fine detail "
                     "(exact props, skin, likeness) that was only ever anchored by them may drift."}),
+                "ref_images_bundle": ("MUSE_REF_IMAGE_SET", {"tooltip":
+                    "Preserved mixed-resolution reference tensors from a Muse Stage-1 scout bundle. "
+                    "Use this in preference to IMAGE when continuing a persisted scout."}),
                 "first_frame": ("IMAGE", {"tooltip":
                     "Leave unconnected to auto-use the first-frame keyframe embedded on the chosen candidate "
                     "(First/Last Frame and Hybrid modes only)."}),
@@ -552,7 +575,9 @@ class MuseMinimaxRefineV2:
                 model=None, candidate_1_latent=None, candidate_2_latent=None,
                 candidate_3_latent=None, candidate_4_latent=None,
                 ref_images=None, first_frame=None, last_frame=None,
-                ref_audio_1=None, ref_audio_2=None, ref_audio_3=None):
+                ref_audio_1=None, ref_audio_2=None, ref_audio_3=None, group_audio_slots="", refine_latent_directory="",
+                preserve_stage1_latents=False, ref_images_bundle=None):
+        # ERASE_TOMORROW_REFINE_AUDIO_CONTROL_V1
         candidates = {
             1: candidate_1_latent, 2: candidate_2_latent,
             3: candidate_3_latent, 4: candidate_4_latent,
@@ -572,29 +597,28 @@ class MuseMinimaxRefineV2:
             return (blocker, blocker)
 
         embedded = chosen_latent if isinstance(chosen_latent, dict) else {}
-        # Prefer the disk-backed checkpoint name over an embedded live model object —
-        # see the Director's own note on _muse_model_checkpoint_name for why: a live
-        # model riding in the candidate is exactly what ComfyUI's cache discards first,
-        # forcing a full re-scout the moment a candidate gets picked. Reload from the
-        # checkpoint name here instead, the same way everything else about a candidate
-        # already comes from disk. _muse_model_used stays as a fallback for candidates
-        # that couldn't determine a checkpoint name (or were scouted before this fix).
-        resolved_model = None
-        _checkpoint_name = embedded.get("_muse_model_checkpoint_name")
-        if _checkpoint_name:
-            from nodes import NODE_CLASS_MAPPINGS as _NCM
-            H3ModelLoaderAny = _NCM.get("H3ModelLoaderAny")
-            if H3ModelLoaderAny is not None:
-                resolved_model = _unpack_node_result(_execute_comfy_node(
-                    H3ModelLoaderAny, model_name=_checkpoint_name,
-                ))[0]
-            else:
-                log.warning("[MuseMinimaxRefineV2] Candidate %d's checkpoint (%s) couldn't be "
-                            "reloaded — 'H3ModelLoaderAny' isn't registered (install "
-                            "ComfyUI-H3-Multishot into custom_nodes). Falling back to the "
-                            "connected model input.", candidate, _checkpoint_name)
+        # A connected model is explicit workflow authority.  This makes it possible
+        # to refine candidates with a model that carries graph-applied LoRAs, instead
+        # of silently replacing that patched model with the bare checkpoint name
+        # embedded by Director.  Keep the original checkpoint-backed path for normal
+        # Director workflows that leave the optional model input disconnected.
+        resolved_model = model
         if resolved_model is None:
-            resolved_model = embedded.get("_muse_model_used") or model
+            _checkpoint_name = embedded.get("_muse_model_checkpoint_name")
+            if _checkpoint_name:
+                from nodes import NODE_CLASS_MAPPINGS as _NCM
+                H3ModelLoaderAny = _NCM.get("H3ModelLoaderAny")
+                if H3ModelLoaderAny is not None:
+                    resolved_model = _unpack_node_result(_execute_comfy_node(
+                        H3ModelLoaderAny, model_name=_checkpoint_name,
+                    ))[0]
+                else:
+                    log.warning("[MuseMinimaxRefineV2] Candidate %d's checkpoint (%s) couldn't be "
+                                "reloaded — 'H3ModelLoaderAny' isn't registered (install "
+                                "ComfyUI-H3-Multishot into custom_nodes). Falling back to the "
+                                "embedded model.", candidate, _checkpoint_name)
+            if resolved_model is None:
+                resolved_model = embedded.get("_muse_model_used")
         if resolved_model is None:
             log.warning("[MuseMinimaxRefineV2] No model connected, and candidate %d has none embedded either "
                         "— wire the correct checkpoint into 'model' manually. Blocking, not running.", candidate)
@@ -602,7 +626,25 @@ class MuseMinimaxRefineV2:
             return (blocker, blocker)
 
         ref_images_dict = None
-        if ref_images is not None and ref_images.shape[0] > 0:
+        per_chunk_ref_images = None
+        if isinstance(ref_images_bundle, dict) and ref_images_bundle:
+            raw_per_chunk = ref_images_bundle.get("__muse_per_chunk_ref_images__")
+            if isinstance(raw_per_chunk, (list, tuple)):
+                per_chunk_ref_images = []
+                for item in raw_per_chunk:
+                    images = {str(key): value for key, value in (item or {}).items() if hasattr(value, "shape")}
+                    if not images:
+                        raise ValueError("A persisted Stage-1 chunk has no usable reference images")
+                    per_chunk_ref_images.append(images)
+                ref_images_dict = per_chunk_ref_images[-1] if per_chunk_ref_images else None
+            else:
+                ref_images_dict = {
+                    str(key): value for key, value in ref_images_bundle.items()
+                    if hasattr(value, "shape")
+                }
+                if not ref_images_dict:
+                    ref_images_dict = None
+        elif ref_images is not None and ref_images.shape[0] > 0:
             ref_images_dict = {f"ref_image_{i}": ref_images[i:i + 1] for i in range(ref_images.shape[0])}
         else:
             log.warning("[MuseMinimaxRefineV2] No ref_images connected — continuing from text/keyframes only. "
@@ -635,6 +677,11 @@ class MuseMinimaxRefineV2:
             blocker = ExecutionBlocker(None)
             return (blocker, blocker)
 
+        if per_chunk_ref_images is not None and len(per_chunk_ref_images) != chunk_count:
+            raise ValueError("Reference image bundle differs from saved group count")
+        from .muse_refine_audio_control import resolve_controls
+        controls = resolve_controls(timeline_data, group_audio_slots, chunk_count,
+            [ref_audio_1, ref_audio_2, ref_audio_3], preserve_stage1_latents, raw_latent_carry_test)
         all_images = []
         all_waveform = []
         audio_sample_rate = None
@@ -649,6 +696,9 @@ class MuseMinimaxRefineV2:
                             chunk_idx + 1, chunk_count, candidate, chunk_path)
                 blocker = ExecutionBlocker(None)
                 return (blocker, blocker)
+            _control = controls[chunk_idx]
+            log.info("[MuseMinimaxRefineV2] group %d audio slots=%s disable_previous_audio=%s",
+                     chunk_idx + 1, _control["slots"], _control["disable_previous_audio"])
             saved = _load_scout_chunk(chunk_path)
             saved_latent = saved["latent"]
             # New V1.2B candidates carry their real Seed Hunt seed and Stage-1 split
@@ -684,21 +734,29 @@ class MuseMinimaxRefineV2:
             )
             chunk_last = last_frame if last_frame is not None else saved.get("last_frame")
             chunk_frame_count = saved.get("frame_count")
-            if chunk_idx > 0 and carry_images is not None and chunk_first is not None:
+            if (not preserve_stage1_latents and chunk_idx > 0 and carry_images is not None
+                    and chunk_first is not None):
                 saved_latent = _rebuild_stage1_continuation(
                     resolved_model, clip, vae, audio_vae, saved["prompt"], saved_latent,
                     chunk_first, chunk_last, chunk_frame_count, resolved_seed, resolved_steps,
                     resolved_first_pass_steps, sampler_name, scheduler,
                     carry_images, carry_audio, carry_length,
                 )
+            chunk_ref_images = (
+                per_chunk_ref_images[chunk_idx]
+                if per_chunk_ref_images is not None and chunk_idx < len(per_chunk_ref_images)
+                else ref_images_dict
+            )
             chunk_images, chunk_audio, chunk_sampled = _refine_one_chunk_beta(
                 resolved_model, clip, vae, audio_vae, saved["prompt"], saved_latent,
                 ref_image_size, resolved_seed, resolved_steps, resolved_first_pass_steps,
                 sampler_name, scheduler, two_stage_latent_upscale_model, two_stage_target_megapixels,
-                ref_images_dict, ref_audios_dict, chunk_first, chunk_last, chunk_frame_count,
+                chunk_ref_images, _control["references"], chunk_first, chunk_last, chunk_frame_count,
                 carry_images, carry_audio, carry_length,
                 raw_latent_carry_test, carry_context_latent,
                 log_label=f"candidate={candidate} chunk={chunk_idx + 1}/{chunk_count}",
+                disable_previous_audio=_control["disable_previous_audio"],
+                checkpoint_directory=refine_latent_directory, checkpoint_index=chunk_idx,
             )
             all_images.append(chunk_images)
             all_waveform.append(chunk_audio["waveform"])
