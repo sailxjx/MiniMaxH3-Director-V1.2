@@ -28,6 +28,25 @@ def function(tree, name):
 
 
 class IntegrationTests(unittest.TestCase):
+    def test_fixed_base_resolution_bypasses_legacy_megapixel_rounding(self):
+        ns = {}
+        for name in ('BASE_RESOLUTION_OPTIONS', 'FIXED_BASE_RESOLUTIONS'):
+            execute_node(assignment(DIRECTOR, name), ns)
+        ns['_resolve_resolution'] = lambda *args: (1376, 768)
+        execute_node(function(DIRECTOR, '_resolve_base_resolution'), ns)
+        self.assertEqual(ns['_resolve_base_resolution']('1344x768', '16:9', 1.0, 32), (1344, 768))
+        self.assertEqual(ns['_resolve_base_resolution']('960x544', '16:9', 0.5, 32), (960, 544))
+        self.assertEqual(ns['_resolve_base_resolution']('auto', '16:9', 1.0, 32), (1376, 768))
+        with self.assertRaises(ValueError):
+            ns['_resolve_base_resolution']('1920x1080', '16:9', 1.0, 32)
+
+    def test_base_resolution_is_optional_and_backward_compatible(self):
+        node = function(DIRECTOR, 'execute')
+        stub = ast.FunctionDef(name='signature', args=node.args, body=[ast.Pass()], decorator_list=[])
+        ns = {}
+        execute_node(stub, ns)
+        self.assertEqual(inspect.signature(ns['signature']).parameters['base_resolution'].default, 'auto')
+
     def test_upstream_sentence_voice_binding(self):
         ns = {'re': re}
         for name in ('_DIALOGUE_RE', '_REPEATED_PUNCT_RE', '_DECORATIVE_RE'):

@@ -19,6 +19,9 @@ This repository bundles **two** ComfyUI nodes — Muse Minimax Director V1.4 and
 
 ## Changelog
 
+### v3.2.1 — 2026-09-11
+- **Added exact Stage-1 canvases for API and UI workflows.** `base_resolution` accepts `960x544` or `1344x768` and bypasses the legacy aspect-ratio/megapixel rounding that turns a nominal 1 MP 16:9 request into `1376x768`. Its `auto` default preserves every existing workflow unchanged.
+
 ### v3.2.0 — 2026-09-06
 - **Fixed: Refine V2 could continue a Seed Hunt candidate against the wrong sigma schedule, producing garbled audio right at the Stage-2 continuation seam.** Refine V2 rebuilt its Stage-2 sigma schedule from its own `steps` widget rather than the total step count the picked candidate was actually generated with — it only ever restored the *split point*, not the total. If those two numbers didn't happen to match, the "remaining schedule" Refine continued the Stage-1 latent against was a genuinely different set of sigma values than what that latent's real noise level corresponded to. Confirmed reproducible: Director `steps=10`, Refine `steps=8` produced garbled audio twice on the same seed; manually matching both to 10 fixed it immediately, which is how the mismatch itself was found. The Director now also embeds the real total step count on the candidate latent (`_muse_steps_used`, same pattern as the seed and first-pass-step values it already embeds), and Refine V2 always uses that instead of its own widget.
 - **UI: Refine V2's `steps` widget is now hidden**, the same way its `seed` and first-pass-step widgets already are — it's fully automatic now, so leaving it visible and editable would only invite the exact same mismatch again for no benefit.

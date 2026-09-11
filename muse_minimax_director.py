@@ -489,6 +489,11 @@ _KEYFRAME_INJECTION_FRAMES = 22
 # so continuation chunks never silently overflow the pool and drop something.
 MAX_CHARACTER_SLOTS = 8
 ASPECT_RATIO_OPTIONS = [a.value for a in AspectRatio]
+BASE_RESOLUTION_OPTIONS = ["auto", "960x544", "1344x768"]
+FIXED_BASE_RESOLUTIONS = {
+    "960x544": (960, 544),
+    "1344x768": (1344, 768),
+}
 # Spacing between Seed Hunt's 4 candidate passes' base seeds — large enough to never
 # collide with the small per-chunk `+chunk_idx` offset already applied inside a pass.
 SEED_HUNT_SEED_STRIDE = 1_000_003
@@ -557,6 +562,17 @@ def _resolve_resolution(aspect_ratio: str, megapixels: float, multiple: int):
     width = round(w_ratio * scale / multiple) * multiple
     height = round(h_ratio * scale / multiple) * multiple
     return width, height
+
+
+def _resolve_base_resolution(base_resolution: str, aspect_ratio: str, megapixels: float, multiple: int):
+    """Resolve an exact approved canvas or retain the legacy calculated behavior."""
+    if base_resolution == "auto":
+        return _resolve_resolution(aspect_ratio, megapixels, multiple)
+    try:
+        return FIXED_BASE_RESOLUTIONS[base_resolution]
+    except KeyError as exc:
+        allowed = ", ".join(FIXED_BASE_RESOLUTIONS)
+        raise ValueError(f"Unsupported base_resolution {base_resolution!r}; expected auto, {allowed}") from exc
 
 
 def _fit_image_to_target(tensor: torch.Tensor, target_w: int, target_h: int, method: str) -> torch.Tensor:
@@ -1863,6 +1879,10 @@ class MuseMinimaxDirector:
                 "prompt_override": ("STRING", {"forceInput": True, "tooltip":
                     "Wire in any plain text node (e.g. a Text Multiline node) with an already-formatted H3 "
                     "prompt. Only takes effect when use_prompt_override is on."}),
+                "base_resolution": (BASE_RESOLUTION_OPTIONS, {"default": "auto", "tooltip":
+                    "Exact Stage-1 canvas. 960x544 and 1344x768 bypass the legacy aspect-ratio/megapixel "
+                    "calculation. Auto preserves existing workflows and uses Aspect Ratio, Megapixels, and "
+                    "Multiple Of exactly as before."}),
                 # Reference (Omni) mode only. Up to 3 reference videos and 3 reference audio
                 # clips, uploaded and scrub-trimmed directly in the timeline UI (timeline_data's
                 # refVideos/refAudios) rather than as graph sockets — same convention as the
@@ -1902,14 +1922,14 @@ class MuseMinimaxDirector:
                 vae_reencode_carry_video_only_test=False,
                 long_form_enabled=False, long_form_project_id="", render_chunk_start=1, render_chunk_end=999,
                 two_stage_enable_temporal_chunking=False, raw_latent_carry_test=True,
-                model_fl2va=None, prompt_override=None, stage1_resume_manifest=""):
+                model_fl2va=None, prompt_override=None, stage1_resume_manifest="", base_resolution="auto"):
         # ERASE_TOMORROW_NATIVE_STAGE1_RESUME_V1
         from . import muse_stage1_resume as _native_resume
         tdata = _parse_timeline(timeline_data)
         # Resolved before any reference image is loaded — every character/background/
         # First-Last-Frame image gets fit to this exact resolution via resize_method,
         # rather than leaving an aspect-ratio mismatch to whatever H3 does internally.
-        width, height = _resolve_resolution(aspect_ratio, megapixels, multiple)
+        width, height = _resolve_base_resolution(base_resolution, aspect_ratio, megapixels, multiple)
         shared_tdata = tdata
         if mode == MODE_HYBRID:
             shared_tdata = dict(tdata)

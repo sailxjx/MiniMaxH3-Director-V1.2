@@ -1,5 +1,13 @@
 # Claude Changes Log — Muse Minimax Director V1.4 / Refine V2
 
+## 2026-09-11 — Added exact Stage-1 resolution selection
+
+`base_resolution` now accepts the project canvases `960x544` and `1344x768`. A fixed
+selection bypasses the stock megapixel calculation, which rounds a 16:9 1 MP request to
+`1376x768`. The default remains `auto`, so saved workflows retain the existing Aspect
+Ratio + Megapixels + Multiple Of behavior. The new input is optional and appended after
+the established inputs to preserve positional compatibility.
+
 ## 2026-09-08 00:39 BST — Fixed: sentence-level speaker controls weakly attached voice references after dialogue
 
 **Reproduction:** two visible female character references, two distinct Voice Reference

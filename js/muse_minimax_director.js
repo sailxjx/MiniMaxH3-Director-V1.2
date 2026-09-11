@@ -86,6 +86,7 @@ const BOXED_WIDGET_NAMES = [
   "vae_reencode_carry_test", "vae_reencode_carry_length", "vae_reencode_carry_video_only_test",
   "long_form_enabled", "long_form_project_id", "render_chunk_start", "render_chunk_end",
   "two_stage_enable_temporal_chunking", "raw_latent_carry_test",
+  "base_resolution",
 ];
 // seed_hunt stays in this list (so it's still found, hidden, and serialized) but is
 // never given a row of its own below — it's legacy-only now, kept purely so an old
@@ -1510,6 +1511,7 @@ class MinimaxTimelineEditor {
     title.textContent = "Resolution";
     box.appendChild(title);
 
+    if (this.realWidgets.base_resolution) box.appendChild(this._selectRow("Exact Base Resolution", this.realWidgets.base_resolution));
     if (this.realWidgets.aspect_ratio) box.appendChild(this._selectRow("Aspect Ratio", this.realWidgets.aspect_ratio));
     if (this.realWidgets.megapixels) box.appendChild(this._numberRow("Megapixels", this.realWidgets.megapixels));
     if (this.realWidgets.multiple) box.appendChild(this._numberRow("Multiple Of", this.realWidgets.multiple));
