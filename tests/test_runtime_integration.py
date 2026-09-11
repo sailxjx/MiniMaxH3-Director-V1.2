@@ -47,6 +47,13 @@ class IntegrationTests(unittest.TestCase):
         execute_node(stub, ns)
         self.assertEqual(inspect.signature(ns['signature']).parameters['base_resolution'].default, 'auto')
 
+    def test_multigroup_refine_offloads_completed_outputs_and_carry_latent(self):
+        source = ast.unparse(function(REFINE, 'execute'))
+        self.assertIn("chunk_images.detach().to(device='cpu').contiguous()", source)
+        self.assertIn("chunk_audio['waveform'].detach().to(device='cpu').contiguous()", source)
+        self.assertIn('_copy_av_latent_to_cpu(chunk_sampled)', source)
+        self.assertIn('torch.cuda.empty_cache()', source)
+
     def test_upstream_sentence_voice_binding(self):
         ns = {'re': re}
         for name in ('_DIALOGUE_RE', '_REPEATED_PUNCT_RE', '_DECORATIVE_RE'):

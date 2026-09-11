@@ -39,6 +39,7 @@ shared by both Director packages, confirmed directly: the Beta Director's own
 scout-bundle-saving code is identical in shape to V1.2's.
 """
 
+import gc
 import logging
 import os
 
@@ -680,6 +681,7 @@ class MuseMinimaxRefineV2:
         if per_chunk_ref_images is not None and len(per_chunk_ref_images) != chunk_count:
             raise ValueError("Reference image bundle differs from saved group count")
         from .muse_refine_audio_control import resolve_controls
+        from .muse_minimax_director import _copy_av_latent_to_cpu
         controls = resolve_controls(timeline_data, group_audio_slots, chunk_count,
             [ref_audio_1, ref_audio_2, ref_audio_3], preserve_stage1_latents, raw_latent_carry_test)
         all_images = []
@@ -758,12 +760,25 @@ class MuseMinimaxRefineV2:
                 disable_previous_audio=_control["disable_previous_audio"],
                 checkpoint_directory=refine_latent_directory, checkpoint_index=chunk_idx,
             )
-            all_images.append(chunk_images)
-            all_waveform.append(chunk_audio["waveform"])
+            # Keep completed groups and next-group context off the GPU. A multi-group
+            # 2K Refine otherwise retains the previous full-resolution sampled AV
+            # latent while allocating the next group's denoising activations, which
+            # can exceed an 80 GB device even though each group succeeds alone.
+            chunk_images_cpu = chunk_images.detach().to(device="cpu").contiguous()
+            chunk_waveform_cpu = chunk_audio["waveform"].detach().to(device="cpu").contiguous()
+            all_images.append(chunk_images_cpu)
+            all_waveform.append(chunk_waveform_cpu)
             audio_sample_rate = chunk_audio["sample_rate"]
-            carry_images = chunk_images
-            carry_audio = chunk_audio
-            carry_context_latent = chunk_sampled
+            carry_images = chunk_images_cpu
+            carry_audio = {"waveform": chunk_waveform_cpu, "sample_rate": audio_sample_rate}
+            carry_context_latent = (
+                _copy_av_latent_to_cpu(chunk_sampled)
+                if chunk_idx + 1 < chunk_count else None
+            )
+            del chunk_images, chunk_audio, chunk_sampled
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         images = torch.cat(all_images, dim=0)
         waveform = torch.cat(all_waveform, dim=-1)

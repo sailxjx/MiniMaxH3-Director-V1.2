@@ -1,5 +1,13 @@
 # Claude Changes Log — Muse Minimax Director V1.4 / Refine V2
 
+## 2026-09-11 — Fixed multi-group 2K Refine GPU retention
+
+After each group finishes, Refine V2 now keeps its decoded images, waveform, and any
+next-group raw AV carry latent as detached CPU tensors. It releases the corresponding
+GPU tensors before the following group starts. The sampled bytes and ordering remain
+unchanged; the change prevents the previous full-resolution group from occupying GPU
+memory while the next group's denoising activations are allocated.
+
 ## 2026-09-11 — Added exact Stage-1 resolution selection
 
 `base_resolution` now accepts the project canvases `960x544` and `1344x768`. A fixed

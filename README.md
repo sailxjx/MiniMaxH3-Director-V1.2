@@ -19,6 +19,9 @@ This repository bundles **two** ComfyUI nodes — Muse Minimax Director V1.4 and
 
 ## Changelog
 
+### v3.2.2 — 2026-09-11
+- **Fixed multi-group 2K Refine VRAM retention.** Completed decoded images, audio, and the next group's raw AV carry latent now move to CPU before the following group allocates its denoising activations. This preserves the exact sampled values while avoiding an 80 GB GPU overflow caused by retaining prior full-resolution tensors.
+
 ### v3.2.1 — 2026-09-11
 - **Added exact Stage-1 canvases for API and UI workflows.** `base_resolution` accepts `960x544` or `1344x768` and bypasses the legacy aspect-ratio/megapixel rounding that turns a nominal 1 MP 16:9 request into `1376x768`. Its `auto` default preserves every existing workflow unchanged.
 
