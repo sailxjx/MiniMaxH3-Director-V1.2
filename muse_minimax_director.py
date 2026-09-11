@@ -1750,7 +1750,7 @@ class MuseMinimaxDirector:
                 "two_stage_latent_upscale_model": (_scan_latent_upscale_models(), {"tooltip":
                     "Which trained latent-upscale checkpoint to use (from "
                     "ComfyUI/models/latent_upscale_models/). Real learned network, not interpolation."}),
-                "two_stage_target_megapixels": ("FLOAT", {"default": 1.0, "min": 0.2, "max": 2.0, "step": 0.01, "tooltip":
+                "two_stage_target_megapixels": ("FLOAT", {"default": 1.0, "min": 0.2, "max": 16.0, "step": 0.01, "tooltip":
                     "Target resolution for the Stage-2 upscale, in megapixels. Aspect ratio is preserved "
                     "and the result is aligned to MiniMax H3's 32-pixel canvas grid."}),
                 "two_stage_seed_hunt_latent_only": ("BOOLEAN", {"default": False, "tooltip":

@@ -28,6 +28,28 @@ def function(tree, name):
 
 
 class IntegrationTests(unittest.TestCase):
+    def test_stage2_wrapper_megapixel_range_matches_upscaler(self):
+        def target_max_values(tree):
+            values = []
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Dict):
+                    continue
+                for key, value in zip(node.keys, node.values):
+                    if not (isinstance(key, ast.Constant)
+                            and key.value == 'two_stage_target_megapixels'):
+                        continue
+                    metadata = value.elts[1]
+                    fields = {
+                        field_key.value: ast.literal_eval(field_value)
+                        for field_key, field_value in zip(metadata.keys, metadata.values)
+                        if isinstance(field_key, ast.Constant)
+                    }
+                    values.append(fields['max'])
+            return values
+
+        self.assertEqual(target_max_values(DIRECTOR), [16.0])
+        self.assertEqual(target_max_values(REFINE), [16.0])
+
     def test_fixed_base_resolution_bypasses_legacy_megapixel_rounding(self):
         ns = {}
         for name in ('BASE_RESOLUTION_OPTIONS', 'FIXED_BASE_RESOLUTIONS'):

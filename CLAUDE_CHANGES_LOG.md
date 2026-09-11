@@ -1,5 +1,12 @@
 # Claude Changes Log — Muse Minimax Director V1.4 / Refine V2
 
+## 2026-09-11 — Matched Stage-2 target range to the latent upscaler
+
+The Director and Refine V2 wrapper schemas now expose the underlying
+`MinimaxH3LatentUpscaler3D` target range through 16.0 megapixels instead of
+stopping at 2.0 megapixels. This changes only the accepted input range; the
+Stage-1 resolution controls and Stage-2 sampling implementation are unchanged.
+
 ## 2026-09-11 — Fixed multi-group 2K Refine GPU retention
 
 After each group finishes, Refine V2 now keeps its decoded images, waveform, and any

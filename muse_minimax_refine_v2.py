@@ -519,7 +519,7 @@ class MuseMinimaxRefineV2:
                     "Which trained latent-upscale checkpoint to use (from "
                     "ComfyUI/models/latent_upscale_models/) — same model family the Beta Director's own "
                     "two-stage upscale uses. Real learned network, not interpolation."}),
-                "two_stage_target_megapixels": ("FLOAT", {"default": 1.0, "min": 0.2, "max": 2.0, "step": 0.1,
+                "two_stage_target_megapixels": ("FLOAT", {"default": 1.0, "min": 0.2, "max": 16.0, "step": 0.1,
                     "tooltip": "Target resolution for the upscale, in megapixels — matches the upscaler node's "
                                "own 'megapixels' sizing mode (aspect ratio preserved, pixel-aligned to 32)."}),
                 "raw_latent_carry_test": ("BOOLEAN", {"default": True, "tooltip":

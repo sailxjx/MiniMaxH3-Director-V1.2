@@ -19,6 +19,9 @@ This repository bundles **two** ComfyUI nodes — Muse Minimax Director V1.4 and
 
 ## Changelog
 
+### v3.2.3 — 2026-09-11
+- **Expanded the Stage-2 target range to match the underlying latent upscaler.** The Director and Refine wrapper inputs now allow up to 16.0 MP instead of stopping at 2.0 MP. Stage-1 resolution controls and the Stage-2 execution path are unchanged.
+
 ### v3.2.2 — 2026-09-11
 - **Fixed multi-group 2K Refine VRAM retention.** Completed decoded images, audio, and the next group's raw AV carry latent now move to CPU before the following group allocates its denoising activations. This preserves the exact sampled values while avoiding an 80 GB GPU overflow caused by retaining prior full-resolution tensors.
 
