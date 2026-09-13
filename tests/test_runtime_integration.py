@@ -124,10 +124,13 @@ class IntegrationTests(unittest.TestCase):
                       and 'not disable_previous_audio' in ast.unparse(n.test))
         expression = compile(ast.Expression(branch.test), '<audio guard>', 'eval')
         ns = dict(prev_chunk_audio=object(), disable_previous_audio=False,
-                  has_fully_copied_audio=False, has_explicit_hybrid_ref_audios=False)
+                  has_fully_copied_audio=False, has_explicit_hybrid_ref_audios=False,
+                  _carry_previous_audio=True)
         self.assertTrue(eval(expression, ns))
         for flag in ('disable_previous_audio', 'has_fully_copied_audio', 'has_explicit_hybrid_ref_audios'):
             self.assertFalse(eval(expression, dict(ns, **{flag: True})))
+        # The carrier policy (off under prompt_override) also removes the soft tail.
+        self.assertFalse(eval(expression, dict(ns, _carry_previous_audio=False)))
 
     def test_raw_av_carry_default_and_video_only_dispatch(self):
         fn = function(REFINE, '_refine_one_chunk_beta')
@@ -157,7 +160,9 @@ class IntegrationTests(unittest.TestCase):
                       and isinstance(n.test, ast.Name) and n.test.id == 'explicit_chunk_frames')
         ns = dict(explicit_chunk_frames=[158, 277], duration_seconds=435 / 24,
                   align_frame_count=lambda x: 5 + 17 * round((x - 5) / 17),
+                  vae_reencode_carry_length=39, raw_latent_carry_test=False,
                   tdata={'chunks': [{'segments': [{'prompt': 'a'}]}, {'segments': [{'prompt': 'b'}]}]})
+        execute_node(function(DIRECTOR, '_validate_explicit_chunk_frames'), ns)
         execute_node(branch, ns)
         self.assertEqual(ns['buckets'][1][0]['prompt'], 'b')
         self.assertEqual(ns['buckets'][1][0]['_abs_start'], 158 / 24)

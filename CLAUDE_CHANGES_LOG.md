@@ -1,5 +1,44 @@
 # Claude Changes Log — Muse Minimax Director V1.4 / Refine V2
 
+## 2026-09-13 — Prompt-override reference slot contract; exact explicit raw-carry frame budget
+
+**1. Explicit group lengths could not be delivered under raw carry.** `timeline_data.chunk_frames`
+was validated as 17k+5 for every group, but a raw-carry continuation is sampled as request + carry
+and loses the carry to the post-decode trim, so its deliverable length is always a multiple of 17.
+No legal request survived; the frame plan silently snapped it (b060a 768p v001 asked 243 per
+continuation group, received 238, 651 frames against a 661 declaration).
+`_validate_explicit_chunk_frames` now checks request + carry for every group after the first
+(raw carry applies there whatever `continuityFromPrev` says) and an explicit request is delivered
+exactly. Seconds-based UI buckets keep the nearest representable run.
+
+**2. Hidden reference slots under `use_prompt_override`.** Continuation chunks receive two
+node-owned carriers: the generated predecessor still, appended after the group's own images as a
+`<Picture N>`, and the previous chunk's audio tail, inserted at `ref_audio_0` ahead of the group's
+voices (the image pool has room after a capped character list; the three-slot audio pool does not,
+so the tail claims slot 0 to avoid being dropped). Both are declared only by the prompt this node
+compiles itself. Upstream V1.0 had no prompt override; the override later replaced the text but not
+the slots, so authored prompts met an unnamed still and voices shifted by one slot.
+`_resolve_carry_reference_injection` turns both carriers off whenever an override is active and
+rejects an explicit `true` for either; without an override the upstream default is unchanged.
+Evidence: a same-seed seam canary with the carriers on versus off measured seam z 1.86 versus 2.56,
+both passing. Comparison: AIMixer ComfyUI_MiniMaxH3_Director keeps `<Picture N>` equal to slot N and
+carries continuity through motion-context latents and keyframes, never through reference slots; the
+T8 conditioning node's `strict_prompt_tags` rejects a tag beyond the connected count.
+
+**3. Tag check.** `_validate_override_media_tags` runs for Reference chunks under an override: a tag
+beyond the connected count is fatal, and every connected slot must be named. Hybrid chunks keep the
+T8 strict check.
+
+**Behaviour note.** A Stage-1 resume or suffix rerun of a bundle generated with the carriers on now
+samples its suffix without them when the request uses an override.
+
+**Server history.** Unreleased edits hand-deployed to the pool on 2026-09-12 (director sha256 prefixes
+09cec316, 9f98a7a2, 992253872ecc) are superseded by this commit. They included an unconditional
+carrier removal that was later turned back into a switch, and a guard that demanded declarations for
+node-owned slots. Their bytes are archived in comfyui-fleet
+`archives/20260913-muse-unreleased-server-drift`. Files touched: `muse_minimax_director.py`,
+`tests/test_slot_contract.py`, `tests/test_runtime_integration.py`.
+
 ## 2026-09-11 — Matched Stage-2 target range to the latent upscaler
 
 The Director and Refine V2 wrapper schemas now expose the underlying

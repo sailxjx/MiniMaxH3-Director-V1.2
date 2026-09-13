@@ -1194,6 +1194,98 @@ _CHUNK_OVERRIDE_HEADER_RE = re.compile(
 )
 
 
+# [2026-09-13] Reference slot contract for timelines whose text arrives through
+# use_prompt_override, plus the explicit raw-carry frame budget. CLAUDE_CHANGES_LOG.md
+# records the incident, the evidence and the comparison with other Director builds.
+_CARRY_REFERENCE_KEYS = ("picture_anchor", "previous_audio_tail")
+_MEDIA_TAG_RE = re.compile(r"<\s*(Picture|Audio|Video)\s+(\d+)\s*>", re.IGNORECASE)
+
+
+def _resolve_carry_reference_injection(tdata: dict, prompt_override_active: bool):
+    """Decide whether continuation chunks receive the node-owned reference carriers.
+
+    The generated predecessor still (a <Picture N>) and the previous chunk's audio
+    tail (an <Audio N>) are declared by the prompt this node compiles itself. An
+    overriding prompt replaces that text but not the slots, so both carriers would
+    reach H3 as references the author never sees: the still is unnamed, and the audio
+    tail takes slot 0 and renumbers every author voice. Under an override both are
+    therefore off and raw latent carry alone supplies continuity. Without an override
+    the upstream default (both on) is unchanged.
+    """
+    raw = tdata.get("carry_reference_injection")
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError("timeline_data.carry_reference_injection must be an object")
+    for key, value in raw.items():
+        if key not in _CARRY_REFERENCE_KEYS:
+            raise ValueError(f"Unknown carry_reference_injection key {key!r}")
+        if not isinstance(value, bool):
+            raise ValueError("carry_reference_injection values must be JSON booleans")
+    if prompt_override_active:
+        requested = [key for key in _CARRY_REFERENCE_KEYS if raw.get(key) is True]
+        if requested:
+            raise ValueError(
+                "carry_reference_injection " + ", ".join(requested) + " cannot be enabled together "
+                "with use_prompt_override: these node-owned reference slots are only declared by "
+                "the prompt this node compiles itself."
+            )
+        return False, False
+    return raw.get("picture_anchor", True), raw.get("previous_audio_tail", True)
+
+
+def _validate_explicit_chunk_frames(frames: list, carry_frames: int) -> None:
+    """Require every explicitly sized group to hand the sampler a legal H3 length.
+
+    Under raw latent carry every group after the first is sampled as its visible
+    request plus the protected carry, whatever its continuityFromPrev flag says, and
+    loses that carry to the post-decode trim. What has to sit on the 17k+5 grid is
+    therefore request + carry, which makes a continuation request a multiple of 17.
+    The first group, and every group when no raw carry is active, is sampled as asked.
+    """
+    if not isinstance(frames, list) or not frames or any(type(value) is not int for value in frames):
+        raise ValueError("timeline_data.chunk_frames must be a list of integers")
+    for index, value in enumerate(frames):
+        if value < 5:
+            raise ValueError("timeline_data.chunk_frames must contain only legal H3 17k+5 frame counts")
+        if carry_frames and index > 0:
+            if align_frame_count(value + carry_frames) != value + carry_frames:
+                raise ValueError(
+                    f"timeline_data.chunk_frames[{index}]={value} plus the {carry_frames}-frame raw carry "
+                    "is not a legal H3 length; a raw-carry continuation group must be a multiple of 17"
+                )
+        elif align_frame_count(value) != value:
+            raise ValueError("timeline_data.chunk_frames must contain only legal H3 17k+5 frame counts")
+
+
+def _validate_override_media_tags(chunk_number: int, prompt: str, counts: dict) -> None:
+    """Match an overriding prompt's media tags to the slots the author connected.
+
+    A tag beyond the connected count is fatal, as in T8 strict_prompt_tags. Every
+    connected slot must also be named, because an unnamed reference reaches H3 with no
+    role. Node-owned carriers are disabled under an override, so these counts are
+    exactly the author's own references in assignment order.
+    """
+    used = {"picture": set(), "audio": set(), "video": set()}
+    for match in _MEDIA_TAG_RE.finditer(prompt or ""):
+        used[match.group(1).lower()].add(int(match.group(2)))
+    problems = []
+    for kind in ("picture", "audio", "video"):
+        count = int(counts.get(kind, 0))
+        label = kind.title()
+        dangling = sorted(number for number in used[kind] if number < 1 or number > count)
+        missing = [number for number in range(1, count + 1) if number not in used[kind]]
+        if dangling:
+            problems.append(", ".join(f"<{label} {n}>" for n in dangling)
+                            + f" not connected (connected {kind} count is {count})")
+        if missing:
+            problems.append(", ".join(f"<{label} {n}>" for n in missing) + " connected but never named")
+    if problems:
+        raise ValueError(
+            f"Chunk {chunk_number}: prompt media tags do not match the connected slots: " + "; ".join(problems)
+        )
+
+
 def _select_chunk_from_prompt_override(prompt_override: str, chunk_idx: int, num_chunks: int) -> str:
     """Only ever called from inside the use_prompt_override branch in execute() —
     structurally cannot run, let alone change anything, when that toggle is off,
@@ -1926,6 +2018,9 @@ class MuseMinimaxDirector:
         # ERASE_TOMORROW_NATIVE_STAGE1_RESUME_V1
         from . import muse_stage1_resume as _native_resume
         tdata = _parse_timeline(timeline_data)
+        _prompt_override_active = bool(use_prompt_override and (prompt_override or "").strip())
+        _carry_picture_anchor, _carry_previous_audio = _resolve_carry_reference_injection(
+            tdata, _prompt_override_active)
         # Resolved before any reference image is loaded — every character/background/
         # First-Last-Frame image gets fit to this exact resolution via resize_method,
         # rather than leaving an aspect-ratio mismatch to whatever H3 does internally.
@@ -2000,8 +2095,10 @@ class MuseMinimaxDirector:
             if (not isinstance(explicit_chunk_frames, list)
                     or any(type(value) is not int for value in explicit_chunk_frames)):
                 raise ValueError("timeline_data.chunk_frames must be a list of integers")
-            if not explicit_chunk_frames or any(value < 5 or align_frame_count(value) != value for value in explicit_chunk_frames):
-                raise ValueError("timeline_data.chunk_frames must contain only legal H3 17k+5 frame counts")
+            _validate_explicit_chunk_frames(
+                explicit_chunk_frames,
+                align_frame_count(max(5, int(vae_reencode_carry_length))) if raw_latent_carry_test else 0,
+            )
             expected_total_frames = int(round(float(duration_seconds) * 24.0))
             if sum(explicit_chunk_frames) != expected_total_frames:
                 raise ValueError("timeline_data.chunk_frames must sum exactly to duration_seconds at 24 FPS")
@@ -2369,8 +2466,12 @@ class MuseMinimaxDirector:
                     # make the sampled target exactly that run plus the protected head.
                     # This prevents the post-decode trim from silently shortening a
                     # nominally 17k+5 visible chunk by five frames.
-                    delivered_visible_frames = max(
-                        17, 17 * int(math.floor(requested_visible_frames / 17.0 + 0.5))
+                    # An explicit chunk_frames request was validated above to sit on the
+                    # grid after the carry, so it is delivered exactly. The seconds-based
+                    # UI buckets keep the nearest representable run.
+                    delivered_visible_frames = (
+                        requested_visible_frames if explicit_chunk_frames
+                        else max(17, 17 * int(math.floor(requested_visible_frames / 17.0 + 0.5)))
                     )
                     raw_carry_frames = align_frame_count(max(5, int(vae_reencode_carry_length)))
                     continuation_extension = raw_carry_frames
@@ -2919,6 +3020,7 @@ class MuseMinimaxDirector:
                         and not disable_previous_audio
                         and not has_fully_copied_audio
                         and not has_explicit_hybrid_ref_audios
+                        and _carry_previous_audio
                     ):
                         # Tail of the previous chunk's own decoded audio, not the whole thing —
                         # H3 treats every ref_audio as a short (2-15s) reference clip.
@@ -3041,6 +3143,7 @@ class MuseMinimaxDirector:
                     # only visual boundary anchor available to this path.
                     use_generated_picture_anchor = (
                         prev_chunk_images is not None and not vae_reencode_carry_test
+                        and _carry_picture_anchor
                     )
                     if use_generated_picture_anchor:
                         last_frame_still = prev_chunk_images[-1:]
@@ -3316,6 +3419,13 @@ class MuseMinimaxDirector:
                         )
                     else:
                         chunk_prompt += "\n" + continuation_instruction
+                if (_prompt_override_active and chunk_generation_mode == MODE_REFERENCE
+                        and not use_hybrid_chunk):
+                    _validate_override_media_tags(chunk_idx + 1, chunk_prompt, {
+                        "picture": len(chunk_ref_images or {}),
+                        "audio": len(chunk_ref_video_audios or {}) + len(chunk_ref_audios or {}),
+                        "video": len(chunk_ref_videos or {}),
+                    })
                 compiled_prompts.append(f"--- Chunk {chunk_idx + 1}/{num_chunks} (~{chunk_len_seconds:.1f}s) ---\n{chunk_prompt}")
 
                 log.info("[MuseMinimaxDirector] chunk %d/%d, seed=%d, length=%d frames, video_carry=%s, audio_carry=%s, hybrid=%s",
