@@ -49,6 +49,17 @@ class CarrierPolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'previous_audio_tail cannot be enabled together'):
             self.resolve({'carry_reference_injection': {'previous_audio_tail': True}}, True)
 
+    def test_override_audio_tail_is_an_explicit_opt_in(self):
+        self.assertEqual(self.resolve({'previous_audio_tail': True}, True), (False, True))
+        self.assertEqual(self.resolve({'previous_audio_tail': False}, True), (False, False))
+        # The picture anchor never comes back under an override.
+        self.assertEqual(self.resolve({'previous_audio_tail': True,
+                                       'carry_reference_injection': {'picture_anchor': False}}, True), (False, True))
+        with self.assertRaisesRegex(ValueError, 'previous_audio_tail must be a JSON boolean'):
+            self.resolve({'previous_audio_tail': 1}, True)
+        # Without an override the upstream default still governs; the key is not a second switch.
+        self.assertEqual(self.resolve({'previous_audio_tail': True}, False), (True, True))
+
     def test_malformed_switches_fail_closed(self):
         with self.assertRaisesRegex(ValueError, 'must be an object'):
             self.resolve({'carry_reference_injection': []}, False)
@@ -115,6 +126,15 @@ class WiringTests(unittest.TestCase):
 
     def test_policy_is_resolved_once_after_parsing(self):
         self.assertEqual(SOURCE.count('_resolve_carry_reference_injection(\n            tdata, _prompt_override_active)'), 1)
+
+    def test_audio_tail_is_appended_after_the_authored_voices(self):
+        # Authored voices are assigned in their own loop; the tail block follows it and
+        # gives up instead of evicting a voice when the three slots are taken.
+        voices_loop = SOURCE.index('for clip_audio, meta, ui_idx in chunk_user_ref_audios:\n                        if audio_slot > 2:')
+        tail_block = SOURCE.index('and _carry_previous_audio\n                    ):\n                        if audio_slot > 2:')
+        self.assertLess(voices_loop, tail_block)
+        self.assertNotIn('ref_audio slots full (3 max, one reserved', SOURCE)
+        self.assertIn('previous-audio tail skipped', SOURCE)
 
     def test_explicit_frames_are_delivered_exactly_and_ui_buckets_still_snap(self):
         self.assertIn('requested_visible_frames if explicit_chunk_frames', SOURCE)

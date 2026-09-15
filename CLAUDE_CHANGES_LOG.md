@@ -1,5 +1,28 @@
 # Claude Changes Log — Muse Minimax Director V1.4 / Refine V2
 
+## 2026-09-15 — Previous-audio tail appended last; explicit opt-in under prompt override
+
+**1. Slot order.** A continuation chunk's previous-audio tail used to be inserted first, as
+`ref_audio_0`, with the authored voices after it ("the three-slot audio pool does not [have room],
+so the tail claims slot 0 to avoid being dropped"). That renumbered every authored `<Audio N>` by
+one and reordered the references for no gain: neither the core Reference node
+(`comfy_extras/nodes_minimax_h3.py` consumes `ref_audios` in dict order as equal reference blocks)
+nor T8 (this node passes `prompt_primary_audio_ordinal=0`) treats slot 0 specially. The authored
+voices now take slots 0.. in list order; the tail is appended after them when it applies and is
+skipped with a log line when the three slots are already taken. `<Audio N>` is therefore N in every
+group, and the tail is `<Audio k+1>`.
+
+**2. Opt-in under an override.** `_resolve_carry_reference_injection` keeps both carriers off under
+`use_prompt_override` by default and still rejects `carry_reference_injection.*: true` there. A new
+`timeline_data.previous_audio_tail: true` re-enables only the audio tail under an override; because
+the tail is now last, an overriding prompt can name it as `<Audio k+1>` and the override tag check
+passes. `picture_anchor` stays off under an override: Hybrid groups already lock a continuation's
+first frame to the predecessor's last decoded frame through T8 `first_frame` (`chunk_first =
+prev_chunk_images[-1:]`), and the Reference-mode trailing still made later groups learn identity
+from their own predecessor (see the comment above `use_generated_picture_anchor`).
+
+Files touched: `muse_minimax_director.py`, `tests/test_slot_contract.py`.
+
 ## 2026-09-13 — Prompt-override reference slot contract; exact explicit raw-carry frame budget
 
 **1. Explicit group lengths could not be delivered under raw carry.** `timeline_data.chunk_frames`

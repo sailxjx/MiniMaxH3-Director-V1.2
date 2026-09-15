@@ -1222,15 +1222,23 @@ def _resolve_carry_reference_injection(tdata: dict, prompt_override_active: bool
             raise ValueError(f"Unknown carry_reference_injection key {key!r}")
         if not isinstance(value, bool):
             raise ValueError("carry_reference_injection values must be JSON booleans")
+    # [2026-09-15] Explicit opt-in for the audio tail under an override. The tail is
+    # appended AFTER the group's own voices as the last ref_audio slot (never slot 0)
+    # and skipped when the three slots are taken, so authored <Audio N> numbering is
+    # stable and the caller can name the tail as <Audio k+1> in its override text.
+    tail_opt_in = tdata.get("previous_audio_tail", False)
+    if not isinstance(tail_opt_in, bool):
+        raise ValueError("timeline_data.previous_audio_tail must be a JSON boolean")
     if prompt_override_active:
         requested = [key for key in _CARRY_REFERENCE_KEYS if raw.get(key) is True]
         if requested:
             raise ValueError(
                 "carry_reference_injection " + ", ".join(requested) + " cannot be enabled together "
                 "with use_prompt_override: these node-owned reference slots are only declared by "
-                "the prompt this node compiles itself."
+                "the prompt this node compiles itself. Use timeline_data.previous_audio_tail for the "
+                "audio tail; it is appended after the authored voices so the override can name it."
             )
-        return False, False
+        return False, tail_opt_in
     return raw.get("picture_anchor", True), raw.get("previous_audio_tail", True)
 
 
@@ -3015,32 +3023,17 @@ class MuseMinimaxDirector:
                     has_explicit_hybrid_ref_audios = (
                         mode == MODE_HYBRID and bool(chunk_user_ref_audios)
                     )
-                    if (
-                        prev_chunk_audio is not None
-                        and not disable_previous_audio
-                        and not has_fully_copied_audio
-                        and not has_explicit_hybrid_ref_audios
-                        and _carry_previous_audio
-                    ):
-                        # Tail of the previous chunk's own decoded audio, not the whole thing —
-                        # H3 treats every ref_audio as a short (2-15s) reference clip.
-                        tail_sr = prev_chunk_audio["sample_rate"]
-                        tail_samples = min(prev_chunk_audio["waveform"].shape[-1], int(4.0 * tail_sr))
-                        tail_wave = prev_chunk_audio["waveform"][..., -tail_samples:]
-                        chunk_ref_audios[f"ref_audio_{audio_slot}"] = {"waveform": tail_wave, "sample_rate": tail_sr}
-                        audio_tag_counter += 1
-                        carry_audio_tag = f"<Audio {audio_tag_counter}>"
-                        chunk_audio_subject_lines.append(f"{carry_audio_tag} is the tail end of the previous shot's own score/ambience.")
-                        chunk_audio_retention_lines.append(
-                            f"{carry_audio_tag} (previous shot's tail): partially_copy - the tail end of the "
-                            "previous shot's own score/ambience continues into this one."
-                        )
-                        task_flags.add("audio reuse")
-                        audio_slot += 1
+                    # [2026-09-15] The authored voices take the slots first, in list order, so
+                    # <Audio N> is N in every group. The previous chunk's tail (when it applies)
+                    # is appended after them, below, and skipped when the three slots are taken;
+                    # it used to claim slot 0 "to avoid being dropped", which renumbered every
+                    # authored voice by one and reordered the references for no gain: neither the
+                    # core Reference node nor T8 (prompt_primary_audio_ordinal=0) treats slot 0
+                    # specially.
                     for clip_audio, meta, ui_idx in chunk_user_ref_audios:
                         if audio_slot > 2:
-                            log.warning("[MuseMinimaxDirector] ref_audio slots full (3 max, one reserved for chunk "
-                                        "carry-over once a chunk has a predecessor) — dropping an extra reference audio clip.")
+                            log.warning("[MuseMinimaxDirector] ref_audio slots full (3 max) — dropping an extra "
+                                        "reference audio clip.")
                             break
                         chunk_ref_audios[f"ref_audio_{audio_slot}"] = clip_audio
                         audio_tag_counter += 1
@@ -3116,6 +3109,32 @@ class MuseMinimaxDirector:
                                 )
                         task_flags.add("audio reuse" if a_retention in ("fully_copy", "partially_copy") else "audio reference")
                         audio_slot += 1
+                    if (
+                        prev_chunk_audio is not None
+                        and not disable_previous_audio
+                        and not has_fully_copied_audio
+                        and not has_explicit_hybrid_ref_audios
+                        and _carry_previous_audio
+                    ):
+                        if audio_slot > 2:
+                            log.warning("[MuseMinimaxDirector] chunk %d: no free ref_audio slot after the authored "
+                                        "voices — previous-audio tail skipped.", chunk_idx + 1)
+                        else:
+                            # Tail of the previous chunk's own decoded audio, not the whole thing —
+                            # H3 treats every ref_audio as a short (2-15s) reference clip.
+                            tail_sr = prev_chunk_audio["sample_rate"]
+                            tail_samples = min(prev_chunk_audio["waveform"].shape[-1], int(4.0 * tail_sr))
+                            tail_wave = prev_chunk_audio["waveform"][..., -tail_samples:]
+                            chunk_ref_audios[f"ref_audio_{audio_slot}"] = {"waveform": tail_wave, "sample_rate": tail_sr}
+                            audio_tag_counter += 1
+                            carry_audio_tag = f"<Audio {audio_tag_counter}>"
+                            chunk_audio_subject_lines.append(f"{carry_audio_tag} is the tail end of the previous shot's own score/ambience.")
+                            chunk_audio_retention_lines.append(
+                                f"{carry_audio_tag} (previous shot's tail): partially_copy - the tail end of the "
+                                "previous shot's own score/ambience continues into this one."
+                            )
+                            task_flags.add("audio reuse")
+                            audio_slot += 1
 
                     # Reference images: characters are always present. Two more optional
                     # slots follow them, INDEPENDENTLY — deliberately not mutually
