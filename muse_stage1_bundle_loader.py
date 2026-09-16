@@ -57,12 +57,23 @@ class MuseStage1ScoutBundleLoad:
             saved = torch.load(path, map_location="cpu", weights_only=False)
             if not isinstance(saved, dict) or not isinstance(saved.get("latent"), dict):
                 raise ValueError(f"Invalid Stage-1 latent payload in {path}")
+            raw_references = saved.get("ref_images")
+            if raw_references is None:
+                raw_references = {}
+            if not isinstance(raw_references, dict):
+                raise ValueError(f"Invalid Stage-1 reference image payload in {path}")
             references = {
-                key: value for key, value in (saved.get("ref_images") or {}).items()
+                key: value for key, value in raw_references.items()
                 if hasattr(value, "shape")
             }
-            if not references:
-                raise ValueError(f"The Stage-1 bundle lacks reference images for {path}")
+            # Reference-mode chunks are allowed to rely entirely on the carried AV
+            # state and their own text prompt.  Native prefix reuse deliberately
+            # persists such chunks with ref_images={} so that a subject which has
+            # left frame is not reintroduced during Stage-2.  Preserve the empty
+            # slot in the per-chunk list; MuseMinimaxRefineV2 routes it through its
+            # existing text-only conditioning path.
+            if raw_references and not references:
+                raise ValueError(f"Stage-1 reference images are unusable in {path}")
             reference_sets.append(references)
         if not isinstance(saved, dict) or not isinstance(saved.get("latent"), dict):
             raise ValueError(f"Invalid Stage-1 latent payload in {chunk_paths[-1]}")

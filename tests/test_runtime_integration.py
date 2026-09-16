@@ -110,6 +110,21 @@ class IntegrationTests(unittest.TestCase):
                               ('refine_latent_directory', ''), ('ref_images_bundle', None)]:
             self.assertEqual(params[name].default, default)
 
+    def test_refine_preserves_empty_per_chunk_reference_scope(self):
+        ns = {}
+        execute_node(function(REFINE, '_normalize_reference_image_bundle'), ns)
+        image = types.SimpleNamespace(shape=(1, 8, 16, 3))
+        global_images, per_chunk = ns['_normalize_reference_image_bundle']({
+            '__muse_per_chunk_ref_images__': [{'ref_image_0': image}, {}],
+        })
+        self.assertEqual(global_images, {})
+        self.assertIs(per_chunk[0]['ref_image_0'], image)
+        self.assertEqual(per_chunk[1], {})
+        with self.assertRaisesRegex(ValueError, 'unusable'):
+            ns['_normalize_reference_image_bundle']({
+                '__muse_per_chunk_ref_images__': [{'ref_image_0': object()}],
+            })
+
     def test_hybrid_uses_opening_then_predecessor_frame(self):
         branch = next(n for n in ast.walk(DIRECTOR) if isinstance(n, ast.If)
                       and isinstance(n.test, ast.Name) and n.test.id == 'use_hybrid_chunk'

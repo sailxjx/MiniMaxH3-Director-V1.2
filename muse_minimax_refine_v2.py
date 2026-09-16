@@ -116,6 +116,32 @@ def _load_scout_chunk(path):
         return torch.load(path, map_location="cpu")
 
 
+def _normalize_reference_image_bundle(ref_images_bundle):
+    """Return (global_images, per_chunk_images) without changing chunk scope."""
+    if not isinstance(ref_images_bundle, dict) or not ref_images_bundle:
+        return None, None
+    raw_per_chunk = ref_images_bundle.get("__muse_per_chunk_ref_images__")
+    if isinstance(raw_per_chunk, (list, tuple)):
+        per_chunk = []
+        for item in raw_per_chunk:
+            if item is None:
+                item = {}
+            if not isinstance(item, dict):
+                raise ValueError("A persisted Stage-1 chunk has an invalid reference image payload")
+            images = {str(key): value for key, value in item.items() if hasattr(value, "shape")}
+            if item and not images:
+                raise ValueError("A persisted Stage-1 chunk has unusable reference images")
+            # An empty mapping is meaningful: this chunk was sampled without image
+            # references and must not inherit another chunk's subjects at Stage-2.
+            per_chunk.append(images)
+        return (per_chunk[-1] if per_chunk else None), per_chunk
+    images = {
+        str(key): value for key, value in ref_images_bundle.items()
+        if hasattr(value, "shape")
+    }
+    return images or None, None
+
+
 def _rebuild_keyframe_conditioning(positive, vae, first_frame, last_frame, tgt_w_px, tgt_h_px, frame_count):
     """Mirrors MuseMinimaxDirector's own _rebuild_keyframe_conditioning_for_stage2 exactly
     (same resize conventions, same conditioning keys) — ported here rather than imported,
@@ -629,22 +655,7 @@ class MuseMinimaxRefineV2:
         ref_images_dict = None
         per_chunk_ref_images = None
         if isinstance(ref_images_bundle, dict) and ref_images_bundle:
-            raw_per_chunk = ref_images_bundle.get("__muse_per_chunk_ref_images__")
-            if isinstance(raw_per_chunk, (list, tuple)):
-                per_chunk_ref_images = []
-                for item in raw_per_chunk:
-                    images = {str(key): value for key, value in (item or {}).items() if hasattr(value, "shape")}
-                    if not images:
-                        raise ValueError("A persisted Stage-1 chunk has no usable reference images")
-                    per_chunk_ref_images.append(images)
-                ref_images_dict = per_chunk_ref_images[-1] if per_chunk_ref_images else None
-            else:
-                ref_images_dict = {
-                    str(key): value for key, value in ref_images_bundle.items()
-                    if hasattr(value, "shape")
-                }
-                if not ref_images_dict:
-                    ref_images_dict = None
+            ref_images_dict, per_chunk_ref_images = _normalize_reference_image_bundle(ref_images_bundle)
         elif ref_images is not None and ref_images.shape[0] > 0:
             ref_images_dict = {f"ref_image_{i}": ref_images[i:i + 1] for i in range(ref_images.shape[0])}
         else:

@@ -17,10 +17,14 @@ class BundleTests(unittest.TestCase):
         self.candidate.mkdir(parents=True)
         self.calls = []
         self.refs = [types.SimpleNamespace(shape=(1, 8, 16, 3)), types.SimpleNamespace(shape=(1, 16, 8, 3))]
+        self.reference_payloads = [
+            {'ref_image_0': self.refs[0]},
+            {'ref_image_0': self.refs[1]},
+        ]
         def load(path, **kwargs):
             self.calls.append(path)
             index = int(Path(path).stem.split('_')[1]) - 1
-            return {'latent': {'samples': index}, 'ref_images': {'ref_image_0': self.refs[index]}}
+            return {'latent': {'samples': index}, 'ref_images': self.reference_payloads[index]}
         modules = {'folder_paths': types.SimpleNamespace(get_output_directory=lambda: str(self.output)),
                    'torch': types.SimpleNamespace(load=load)}
         spec = importlib.util.spec_from_file_location('bundle_under_test', Path(__file__).resolve().parents[1] / 'muse_stage1_bundle_loader.py')
@@ -37,6 +41,22 @@ class BundleTests(unittest.TestCase):
         self.assertIs(refs[1]['ref_image_0'], self.refs[1])
         self.assertEqual(latent['_muse_scout_bundle']['chunk_count'], 2)
         self.assertEqual(latent['samples'], 1)
+
+    def test_preserves_intentionally_empty_reference_chunk(self):
+        for index in (1, 2):
+            (self.candidate / f'chunk_{index:04d}.pt').touch()
+        self.reference_payloads[1] = {}
+        latent, bundle = self.module.MuseStage1ScoutBundleLoad().load(str(self.root), 0, 39)
+        refs = bundle['__muse_per_chunk_ref_images__']
+        self.assertIs(refs[0]['ref_image_0'], self.refs[0])
+        self.assertEqual(refs[1], {})
+        self.assertEqual(latent['_muse_scout_bundle']['chunk_count'], 2)
+
+    def test_rejects_nonempty_reference_payload_without_tensors(self):
+        (self.candidate / 'chunk_0001.pt').touch()
+        self.reference_payloads[0] = {'ref_image_0': object()}
+        with self.assertRaisesRegex(ValueError, 'unusable'):
+            self.module.MuseStage1ScoutBundleLoad().load(str(self.root), 0, 39)
 
     def test_gap_rejected_before_deserialization(self):
         for index in (1, 3):
