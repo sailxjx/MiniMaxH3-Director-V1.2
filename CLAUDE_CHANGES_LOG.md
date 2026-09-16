@@ -1,5 +1,40 @@
 # Claude Changes Log — Muse Minimax Director V1.4 / Refine V2
 
+## 2026-09-16 — disable_previous_audio no longer requires a native-resume Reference suffix
+
+**Root cause traced.** A trailing zero-`ref_audio` chunk immediately following a chunk with real
+spoken dialogue was reproducibly inheriting the *previous* chunk's actual voice (correct timbre,
+nonsense content) for its first ~39 frames, then generating fully ungrounded, unintelligible audio
+for the remainder. Traced to `raw_latent_carry_test`'s joint audio+video latent hard-freeze
+(`MiniMaxH3GeneratedAVMaskedContext`): with no per-chunk opt-out, every chunk after the first gets
+the previous chunk's *actual decoded audio* frozen into its own opening frames regardless of
+whether that chunk wants any audio continuity at all. `previous_audio_tail` (2026-09-15, above) does
+not touch this — it only adds an explicit *soft* reference alongside the same unconditional freeze,
+so it cannot prevent a live speaker's real voice from bleeding into a chunk that has nothing of its
+own to say. This exact failure and its fix are already on record in this project's own accepted
+history (`b010` C02 "choice hold" and `b060a`'s `production_native_stage1_v002`): both used
+`disable_previous_audio` (video-only carry — freeze video, leave audio fully unconditioned on that
+chunk) to keep a live-speech tail from bleeding into a silent hold, and it worked. But that path
+only existed through the native Stage-1 resume runner (`run_muse_controlled_resume.py`); a plain,
+one-shot multi-chunk submission (`run_muse_controlled_stage1.py`, this project's normal path) had no
+way to reach it — its validation gate raised unless `_native_resume_plan is not None`.
+
+**Fix.** `_video_only_carry_inject` never depended on native-resume state or on which mode the
+current chunk's own positive conditioning uses — only on `chunk_idx > 0` and this chunk's own raw
+carry-source latent, both present in a plain one-shot call. The gate now only checks
+`chunk_idx == 0` (still meaningless there — no previous chunk to carry video from). Also fixed a
+second, previously unconditional freeze: two-stage sampling's post-upscale re-freeze
+(`prev_chunk_final_context_latent` re-injection, "Stage 2 raw-latent carry") always called
+`MiniMaxH3GeneratedAVMaskedContext` regardless of `disable_previous_audio`, which would have quietly
+reinstated the audio-inclusive freeze the Stage-1 injection had just opted out of, on any run with
+`two_stage_sampling=True` (i.e. every 768p+ job this project runs). Both sites now dispatch the same
+way. No mode restriction remains either — the mechanism is a pure tensor operation on the joint
+latent, independent of Reference vs Hybrid conditioning; the old `generation_mode == "Reference"`
+requirement only reflected the one context this had CPU tests for.
+
+Files touched: `muse_minimax_director.py`, `tests/test_disable_previous_audio_outside_resume.py`
+(new). All 57 existing + new CPU tests pass. GPU render validation pending.
+
 ## 2026-09-15 — Previous-audio tail appended last; explicit opt-in under prompt override
 
 **1. Slot order.** A continuation chunk's previous-audio tail used to be inserted first, as
