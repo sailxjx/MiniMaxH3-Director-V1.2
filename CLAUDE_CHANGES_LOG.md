@@ -1,5 +1,44 @@
 # Claude Changes Log — Muse Minimax Director V1.4 / Refine V2
 
+## 2026-09-16 (later) — GPU-confirmed: previous_audio_tail and disable_previous_audio fix
+## two DIFFERENT symptoms of the same bug; ship them together, not either alone
+
+**Do not re-litigate this without reading this entry first — it corrects an assumption made
+earlier the same day (below) after real GPU renders came back.**
+
+Two real turbo-8-step renders exercised `previous_audio_tail` alone (no `disable_previous_audio`)
+on the exact `b010_mod001` G03 and `b060a` G03 hazard cases from the entry below. User-verified
+listening result:
+
+- `b060a` G03: audio problem fully fixed.
+- `b010_mod001` G03: the opening ~5s of audio was still wrong; everything after that was normal.
+
+This is fully consistent with the mechanism, not a contradiction of it: `previous_audio_tail` adds
+an explicit, correctly-labeled soft `ref_audio` reference ("previous shot's own score/ambience")
+that the chunk can condition the REST of its generation on — this is exactly why the later portion
+came out normal in both cases, where before (with neither fix) it hallucinated fully ungrounded,
+often unintelligible audio for the whole remainder. But `previous_audio_tail` never touches the
+hard freeze itself — `raw_latent_carry_test`'s `MiniMaxH3GeneratedAVMaskedContext` unconditionally
+copies the previous chunk's real decoded audio into this chunk's opening ~39 frames (~1.6s)
+regardless of this flag. That frozen opening is still the previous speaker's real, out-of-context
+voice. Whether that reads as "broken" is content-dependent: `b060a`'s G2→G3 cut stays inside the
+same continuous close-up domestic scene, so the frozen fragment plausibly passed as a natural
+vocal trail-off; `b010_mod001`'s G2→G3 cut is a bigger scene/mood shift (an argument → a quiet
+first-person watching shot), so the identical mechanism read as an obvious non-sequitur. Relying on
+`previous_audio_tail` alone to fix this class of bug is therefore a content-dependent gamble, not a
+fix — it happened to pass for one of the two real cases tested and not the other.
+
+**Correct default going forward: turn both on together** for the same hazard condition (a chunk
+with no audio references of its own, immediately following a chunk that had real spoken dialogue).
+`disable_previous_audio` removes the frozen-opening bleed; `previous_audio_tail` keeps the rest of
+the chunk grounded instead of unconditioned. Neither one closes both gaps alone. Implemented as the
+paired smart default in `tools/build_muse_stage1_config.py` (erase-tomorrow repo) — see that file's
+own dated comment block for the exact condition and citations.
+
+GPU validation of the *combined* fix (both flags together) is still pending as of this entry —
+only `previous_audio_tail` alone has been GPU-tested so far. Do not assume the combination is
+GPU-confirmed until a render with both flags on has actually been listened to.
+
 ## 2026-09-16 — disable_previous_audio no longer requires a native-resume Reference suffix
 
 **Root cause traced.** A trailing zero-`ref_audio` chunk immediately following a chunk with real
