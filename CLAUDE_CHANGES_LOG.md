@@ -1,78 +1,43 @@
 # Claude Changes Log — Muse Minimax Director V1.4 / Refine V2
 
-## 2026-09-16 (later) — GPU-confirmed: previous_audio_tail and disable_previous_audio fix
-## two DIFFERENT symptoms of the same bug; ship them together, not either alone
+## 2026-09-16 — Group-boundary audio: what the renders showed, and the revert of the untested `disable_previous_audio` widening
 
-**Do not re-litigate this without reading this entry first — it corrects an assumption made
-earlier the same day (below) after real GPU renders came back.**
+**Symptom.** Two 25-step production renders in erase-tomorrow (`b060a` G3 after the line
+"下次还是你自己来"; `b010_mod001` "last group") were reported as garbled audio. Both trailing
+groups have no `ref_audio` of their own and follow a spoken group.
 
-Two real turbo-8-step renders exercised `previous_audio_tail` alone (no `disable_previous_audio`)
-on the exact `b010_mod001` G03 and `b060a` G03 hazard cases from the entry below. User-verified
-listening result:
+**What was actually measured (200 ms RMS on the delivered provider_raw, 32 kHz).** The raw
+AV carry head (39 frames) is sampled and then trimmed from both video and audio before
+concatenation (`trim_n = chunk_carry_trim_frames`, `waveform[..., audio_trim_samples:]`), so
+no delivered chunk ever opens with the previous speaker's frozen voice: G3's first 1.6 s sits
+at -55..-66 dB in all four renders against about -20 dB for G2's last line. The carry only
+conditions the next group's own generation on "speech just ended".
 
-- `b060a` G03: audio problem fully fixed.
-- `b010_mod001` G03: the opening ~5s of audio was still wrong; everything after that was normal.
+- `b060a` G3, raw carry only: digital silence (-76 dB) with two bursts (-37..-58 dB) — the
+  garbling the user heard.
+- `b060a` G3, raw carry + `previous_audio_tail` (turbo 8-step, same seed): continuous faint
+  room tone (-60..-73 dB), one weaker burst. User: fixed.
+- `b010_mod001` G3, both variants: uniform faint hiss, no bursts. The complaint there is G01
+  (4.9–6.5 s), a first chunk that hallucinates a meaningless Mandarin-sounding utterance while
+  its prompt says "closes her lips as if about to speak". Not a carry issue; a prompt/seed issue.
 
-This is fully consistent with the mechanism, not a contradiction of it: `previous_audio_tail` adds
-an explicit, correctly-labeled soft `ref_audio` reference ("previous shot's own score/ambience")
-that the chunk can condition the REST of its generation on — this is exactly why the later portion
-came out normal in both cases, where before (with neither fix) it hallucinated fully ungrounded,
-often unintelligible audio for the whole remainder. But `previous_audio_tail` never touches the
-hard freeze itself — `raw_latent_carry_test`'s `MiniMaxH3GeneratedAVMaskedContext` unconditionally
-copies the previous chunk's real decoded audio into this chunk's opening ~39 frames (~1.6s)
-regardless of this flag. That frozen opening is still the previous speaker's real, out-of-context
-voice. Whether that reads as "broken" is content-dependent: `b060a`'s G2→G3 cut stays inside the
-same continuous close-up domestic scene, so the frozen fragment plausibly passed as a natural
-vocal trail-off; `b010_mod001`'s G2→G3 cut is a bigger scene/mood shift (an argument → a quiet
-first-person watching shot), so the identical mechanism read as an obvious non-sequitur. Relying on
-`previous_audio_tail` alone to fix this class of bug is therefore a content-dependent gamble, not a
-fix — it happened to pass for one of the two real cases tested and not the other.
+**Decision (erase-tomorrow side).** Audio continuity between groups is the default: raw AV
+carry as before, plus `timeline.previous_audio_tail` on every multi-group plan. The runner
+writes the tail's two prompt lines (`chunk_audio_subject_lines` / `chunk_audio_retention_lines`
+wording) into the override prompt itself, since under `use_prompt_override` this node does not.
 
-**Correct default going forward: turn both on together** for the same hazard condition (a chunk
-with no audio references of its own, immediately following a chunk that had real spoken dialogue).
-`disable_previous_audio` removes the frozen-opening bleed; `previous_audio_tail` keeps the rest of
-the chunk grounded instead of unconditioned. Neither one closes both gaps alone. Implemented as the
-paired smart default in `tools/build_muse_stage1_config.py` (erase-tomorrow repo) — see that file's
-own dated comment block for the exact condition and citations.
+**Reverted, never deployed: `c523666` ("Allow disable_previous_audio outside native-resume;
+fix Stage-2 re-freeze gap").** Its premise (a delivered frozen-voice bleed) was wrong, it had
+no GPU render, and the soft tail is skipped whenever `disable_previous_audio` is set (the
+`not disable_previous_audio` guard on the tail injection), so a group with that flag is left
+with text-only audio conditioning — the same condition under which `b010_mod001` G01
+hallucinated speech. The deployed comfyui-fleet release `20260916-muse-69d0dda` was built
+from `69d0dda` (its `muse_minimax_director.py` hash matches that commit), so the pool never
+ran the widened gate; the native-resume-only `disable_previous_audio` (b010 C02 choice-hold,
+Refine-stage video-only carry) is unchanged. The same-day changelog entry claiming the two
+flags were "GPU-confirmed" to be needed together is withdrawn with this one.
 
-GPU validation of the *combined* fix (both flags together) is still pending as of this entry —
-only `previous_audio_tail` alone has been GPU-tested so far. Do not assume the combination is
-GPU-confirmed until a render with both flags on has actually been listened to.
-
-## 2026-09-16 — disable_previous_audio no longer requires a native-resume Reference suffix
-
-**Root cause traced.** A trailing zero-`ref_audio` chunk immediately following a chunk with real
-spoken dialogue was reproducibly inheriting the *previous* chunk's actual voice (correct timbre,
-nonsense content) for its first ~39 frames, then generating fully ungrounded, unintelligible audio
-for the remainder. Traced to `raw_latent_carry_test`'s joint audio+video latent hard-freeze
-(`MiniMaxH3GeneratedAVMaskedContext`): with no per-chunk opt-out, every chunk after the first gets
-the previous chunk's *actual decoded audio* frozen into its own opening frames regardless of
-whether that chunk wants any audio continuity at all. `previous_audio_tail` (2026-09-15, above) does
-not touch this — it only adds an explicit *soft* reference alongside the same unconditional freeze,
-so it cannot prevent a live speaker's real voice from bleeding into a chunk that has nothing of its
-own to say. This exact failure and its fix are already on record in this project's own accepted
-history (`b010` C02 "choice hold" and `b060a`'s `production_native_stage1_v002`): both used
-`disable_previous_audio` (video-only carry — freeze video, leave audio fully unconditioned on that
-chunk) to keep a live-speech tail from bleeding into a silent hold, and it worked. But that path
-only existed through the native Stage-1 resume runner (`run_muse_controlled_resume.py`); a plain,
-one-shot multi-chunk submission (`run_muse_controlled_stage1.py`, this project's normal path) had no
-way to reach it — its validation gate raised unless `_native_resume_plan is not None`.
-
-**Fix.** `_video_only_carry_inject` never depended on native-resume state or on which mode the
-current chunk's own positive conditioning uses — only on `chunk_idx > 0` and this chunk's own raw
-carry-source latent, both present in a plain one-shot call. The gate now only checks
-`chunk_idx == 0` (still meaningless there — no previous chunk to carry video from). Also fixed a
-second, previously unconditional freeze: two-stage sampling's post-upscale re-freeze
-(`prev_chunk_final_context_latent` re-injection, "Stage 2 raw-latent carry") always called
-`MiniMaxH3GeneratedAVMaskedContext` regardless of `disable_previous_audio`, which would have quietly
-reinstated the audio-inclusive freeze the Stage-1 injection had just opted out of, on any run with
-`two_stage_sampling=True` (i.e. every 768p+ job this project runs). Both sites now dispatch the same
-way. No mode restriction remains either — the mechanism is a pure tensor operation on the joint
-latent, independent of Reference vs Hybrid conditioning; the old `generation_mode == "Reference"`
-requirement only reflected the one context this had CPU tests for.
-
-Files touched: `muse_minimax_director.py`, `tests/test_disable_previous_audio_outside_resume.py`
-(new). All 57 existing + new CPU tests pass. GPU render validation pending.
+Files touched: `muse_minimax_director.py` (revert), `tests/test_disable_previous_audio_outside_resume.py` (removed).
 
 ## 2026-09-15 — Previous-audio tail appended last; explicit opt-in under prompt override
 

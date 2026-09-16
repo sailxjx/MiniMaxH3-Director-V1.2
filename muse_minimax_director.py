@@ -2516,21 +2516,14 @@ class MuseMinimaxDirector:
                 # use it too.
                 saved_chunks_for_pg = tdata.get("chunks") or []
                 this_chunk_data = saved_chunks_for_pg[chunk_idx] if chunk_idx < len(saved_chunks_for_pg) else {}
-                # ERASE_TOMORROW_PREVIOUS_AUDIO_CONTROL_V1 — originally gated to native-resume
-                # Reference suffixes only, because that was the sole context this had CPU
-                # tensor tests for (the b010 C02 choice-hold fix). _video_only_carry_inject
-                # itself has no dependency on _native_resume_plan or on which mode this
-                # chunk's own positive conditioning uses — it only needs chunk_idx > 0 and
-                # this chunk's own raw_carry_stage1_source, both present in a plain one-shot
-                # multi-chunk call too. Widened once the identical hazard (a trailing
-                # zero-ref_audio group inheriting a live speaker's real voice through the
-                # blind joint-AV freeze) was confirmed in a plain stage1 call, in both
-                # Reference and Hybrid mode — see tests/test_disable_previous_audio_outside_resume.py.
+                # ERASE_TOMORROW_PREVIOUS_AUDIO_CONTROL_V1
                 disable_previous_audio = this_chunk_data.get("disable_previous_audio", False)
                 if not isinstance(disable_previous_audio, bool):
                     raise ValueError("disable_previous_audio must be a JSON boolean")
-                if disable_previous_audio and chunk_idx == 0:
-                    raise ValueError("disable_previous_audio has no previous chunk to carry video from on chunk 1")
+                if disable_previous_audio and (
+                        _native_resume_plan is None or chunk_idx == 0
+                        or this_chunk_data.get("generation_mode") != "Reference"):
+                    raise ValueError("Video-only carry currently requires a resumed native Reference suffix")
                 # ERASE_TOMORROW_SUFFIX_SEED_MASK_V2
                 if "seed_override" in this_chunk_data:
                     override = this_chunk_data["seed_override"]
@@ -3961,26 +3954,12 @@ class MuseMinimaxDirector:
                             # final-resolution previous-chunk latent this time (Stage 2's
                             # own target, post-upscale). No new guider needed —
                             # positive_stage2/stage2_guider are untouched, only the latent.
-                            # disable_previous_audio must re-apply here too: this second
-                            # freeze happens strictly after the first (see this block's own
-                            # comment on why two-stage needs both) and fully overwrites
-                            # whatever the first injection did, audio included — a chunk
-                            # that opted out of the joint-AV freeze above would silently
-                            # have it reinstated here otherwise.
-                            if disable_previous_audio:
-                                recombined, carry_trim_frames = _video_only_carry_inject(
-                                    recombined, prev_chunk_final_context_latent["samples"].unbind()[0],
-                                    align_frame_count(max(5, int(vae_reencode_carry_length))))
-                                log.info("[MuseMinimaxDirector] chunk %d Stage 2 previous audio disabled: "
-                                         "soft tail reference omitted, audio latent unconditioned; "
-                                         "raw visual carry and trim=%d retained", chunk_idx + 1, carry_trim_frames)
-                            else:
-                                recombined, carry_trim_frames = _unpack_node_result(_execute_comfy_node(
-                                    MiniMaxH3GeneratedAVMaskedContext,
-                                    latent=recombined,
-                                    source_latent={"samples": prev_chunk_final_context_latent["samples"]},
-                                    context_length=int(vae_reencode_carry_length), audio_feather_ticks=8,
-                                ))[:2]
+                            recombined, carry_trim_frames = _unpack_node_result(_execute_comfy_node(
+                                MiniMaxH3GeneratedAVMaskedContext,
+                                latent=recombined,
+                                source_latent={"samples": prev_chunk_final_context_latent["samples"]},
+                                context_length=int(vae_reencode_carry_length), audio_feather_ticks=8,
+                            ))[:2]
                             chunk_carry_trim_frames = int(carry_trim_frames)
                             log.info(
                                 "[MuseMinimaxDirector] chunk %d Stage 2 raw-latent carry: requested "
