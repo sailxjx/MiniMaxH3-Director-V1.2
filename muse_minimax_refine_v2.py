@@ -345,7 +345,7 @@ def _refine_one_chunk_beta(
         MinimaxH3LatentUpscaler3D,
         latent={"samples": video_samples},
         model_name=two_stage_latent_upscale_model,
-        mode={"mode": "scale_by", "scale": float(two_stage_upscale_scale)},
+        mode={"mode": "scale by multiplier", "scale": float(two_stage_upscale_scale)},
         align=CANVAS_MULTIPLE,
         enable_temporal_chunking=True,
         force_unload=True,

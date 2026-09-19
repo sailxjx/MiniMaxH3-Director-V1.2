@@ -41,7 +41,7 @@ class IntegrationTests(unittest.TestCase):
         )
         mode = next(keyword.value for keyword in call.keywords if keyword.arg == 'mode')
         self.assertEqual(ast.literal_eval(mode.keys[0]), 'mode')
-        self.assertEqual(ast.literal_eval(mode.values[0]), 'scale_by')
+        self.assertEqual(ast.literal_eval(mode.values[0]), 'scale by multiplier')
         self.assertEqual(ast.literal_eval(mode.keys[1]), 'scale')
         self.assertEqual(ast.unparse(mode.values[1]), 'float(two_stage_upscale_scale)')
 
