@@ -28,27 +28,22 @@ def function(tree, name):
 
 
 class IntegrationTests(unittest.TestCase):
-    def test_stage2_wrapper_megapixel_range_matches_upscaler(self):
-        def target_max_values(tree):
-            values = []
-            for node in ast.walk(tree):
-                if not isinstance(node, ast.Dict):
-                    continue
-                for key, value in zip(node.keys, node.values):
-                    if not (isinstance(key, ast.Constant)
-                            and key.value == 'two_stage_target_megapixels'):
-                        continue
-                    metadata = value.elts[1]
-                    fields = {
-                        field_key.value: ast.literal_eval(field_value)
-                        for field_key, field_value in zip(metadata.keys, metadata.values)
-                        if isinstance(field_key, ast.Constant)
-                    }
-                    values.append(fields['max'])
-            return values
-
-        self.assertEqual(target_max_values(DIRECTOR), [16.0])
-        self.assertEqual(target_max_values(REFINE), [16.0])
+    def test_refine_wrapper_uses_only_an_explicit_upscale_multiplier(self):
+        source = ast.unparse(REFINE)
+        self.assertIn("'two_stage_upscale_scale'", source)
+        self.assertNotIn("'two_stage_target_megapixels'", source)
+        call = next(
+            node for node in ast.walk(REFINE)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == '_execute_comfy_node'
+            and any(keyword.arg == 'mode' for keyword in node.keywords)
+        )
+        mode = next(keyword.value for keyword in call.keywords if keyword.arg == 'mode')
+        self.assertEqual(ast.literal_eval(mode.keys[0]), 'mode')
+        self.assertEqual(ast.literal_eval(mode.values[0]), 'scale_by')
+        self.assertEqual(ast.literal_eval(mode.keys[1]), 'scale')
+        self.assertEqual(ast.unparse(mode.values[1]), 'float(two_stage_upscale_scale)')
 
     def test_fixed_base_resolution_bypasses_legacy_megapixel_rounding(self):
         ns = {}

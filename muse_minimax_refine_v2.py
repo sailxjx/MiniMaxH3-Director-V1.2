@@ -247,7 +247,7 @@ def _rebuild_stage1_continuation(model, clip, vae, audio_vae, prompt, old_stage1
 def _refine_one_chunk_beta(
     model, clip, vae, audio_vae, chunk_prompt, chunk_latent,
     ref_image_size, seed, steps, two_stage_first_pass_steps,
-    sampler_name, scheduler, two_stage_latent_upscale_model, two_stage_target_megapixels,
+    sampler_name, scheduler, two_stage_latent_upscale_model, two_stage_upscale_scale,
     ref_images_dict, ref_audios_dict, first_frame, last_frame, frame_count,
     carry_images, carry_audio, carry_length,
     raw_latent_carry_test, carry_context_latent,
@@ -345,7 +345,7 @@ def _refine_one_chunk_beta(
         MinimaxH3LatentUpscaler3D,
         latent={"samples": video_samples},
         model_name=two_stage_latent_upscale_model,
-        mode={"mode": "megapixels", "megapixels": float(two_stage_target_megapixels)},
+        mode={"mode": "scale_by", "scale": float(two_stage_upscale_scale)},
         align=CANVAS_MULTIPLE,
         enable_temporal_chunking=True,
         force_unload=True,
@@ -386,8 +386,8 @@ def _refine_one_chunk_beta(
     upscaled_video["noise_mask"] = torch.ones_like(upscaled_samples)
     log.info(
         "[MuseMinimaxRefineV2] %s upscale (MinimaxH3LatentUpscaler3D): latent %dx%d -> %dx%d "
-        "(requested %.2f MP, effective %.3fx/%.3fx)",
-        log_label, cur_w_latent, cur_h_latent, tgt_w, tgt_h, float(two_stage_target_megapixels), eff_x, eff_y,
+        "(requested %.3fx, effective %.3fx/%.3fx)",
+        log_label, cur_w_latent, cur_h_latent, tgt_w, tgt_h, float(two_stage_upscale_scale), eff_x, eff_y,
     )
 
     noise1 = _unpack_node_result(_execute_comfy_node(
@@ -545,9 +545,9 @@ class MuseMinimaxRefineV2:
                     "Which trained latent-upscale checkpoint to use (from "
                     "ComfyUI/models/latent_upscale_models/) — same model family the Beta Director's own "
                     "two-stage upscale uses. Real learned network, not interpolation."}),
-                "two_stage_target_megapixels": ("FLOAT", {"default": 1.0, "min": 0.2, "max": 16.0, "step": 0.1,
-                    "tooltip": "Target resolution for the upscale, in megapixels — matches the upscaler node's "
-                               "own 'megapixels' sizing mode (aspect ratio preserved, pixel-aligned to 32)."}),
+                "two_stage_upscale_scale": ("FLOAT", {"default": 2.0, "min": 1.01, "max": 8.0, "step": 0.1,
+                    "tooltip": "Uniform learned-latent upscale multiplier. The output canvas is the Stage-1 "
+                               "canvas multiplied by this value, then aligned to the H3 canvas grid."}),
                 "raw_latent_carry_test": ("BOOLEAN", {"default": True, "tooltip":
                     "For multi-chunk candidates only. Genuinely freezes each continuation chunk's own opening "
                     "latent using the PREVIOUS refined chunk's raw final sampled latent (no VAE round trip) — "
@@ -597,7 +597,7 @@ class MuseMinimaxRefineV2:
 
     def execute(self, clip, vae, audio_vae, prompt, candidate,
                 ref_image_size, seed, steps, two_stage_first_pass_steps,
-                sampler_name, scheduler, two_stage_latent_upscale_model, two_stage_target_megapixels,
+                sampler_name, scheduler, two_stage_latent_upscale_model, two_stage_upscale_scale,
                 raw_latent_carry_test, timeline_data,
                 model=None, candidate_1_latent=None, candidate_2_latent=None,
                 candidate_3_latent=None, candidate_4_latent=None,
@@ -763,7 +763,7 @@ class MuseMinimaxRefineV2:
             chunk_images, chunk_audio, chunk_sampled = _refine_one_chunk_beta(
                 resolved_model, clip, vae, audio_vae, saved["prompt"], saved_latent,
                 ref_image_size, resolved_seed, resolved_steps, resolved_first_pass_steps,
-                sampler_name, scheduler, two_stage_latent_upscale_model, two_stage_target_megapixels,
+                sampler_name, scheduler, two_stage_latent_upscale_model, two_stage_upscale_scale,
                 chunk_ref_images, _control["references"], chunk_first, chunk_last, chunk_frame_count,
                 carry_images, carry_audio, carry_length,
                 raw_latent_carry_test, carry_context_latent,
